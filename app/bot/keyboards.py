@@ -441,7 +441,11 @@ def login_email_domains_panel(
     for index, domain in enumerate(domains):
         marker = "✅" if domain == selected_domain else "○"
         backend = domain_backends.get(domain, "cloudflare")
-        backend_text = "☁️ CF TempMail" if backend == "cloudflare" else "✉️ Gmail"
+        backend_text = {
+            "cloudflare": "☁️ CF TempMail",
+            "gmail": "✉️ Gmail",
+            "selfhosted": "🏠 自建 TempMail",
+        }.get(backend, backend)
         rows.append(
             [
                 InlineKeyboardButton(

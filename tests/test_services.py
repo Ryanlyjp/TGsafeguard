@@ -185,7 +185,20 @@ def test_domain_add_prompt_has_clickable_cancel_button() -> None:
     assert button.callback_data == "flow:cancel"
 
 
-def test_telegram_domain_button_switches_the_reader_backend(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("configured_backends", "current_backend", "expected_backend"),
+    [
+        ({"cloudflare", "gmail"}, "cloudflare", "gmail"),
+        ({"gmail"}, "cloudflare", "gmail"),
+        ({"cloudflare", "gmail", "selfhosted"}, "gmail", "selfhosted"),
+    ],
+)
+def test_telegram_domain_button_switches_the_reader_backend(
+    monkeypatch,
+    configured_backends: set[str],
+    current_backend: str,
+    expected_backend: str,
+) -> None:
     class Session:
         async def __aenter__(self):
             return self
@@ -200,8 +213,13 @@ def test_telegram_domain_button_switches_the_reader_backend(monkeypatch) -> None
     )
     monkeypatch.setattr(
         handlers,
+        "settings",
+        SimpleNamespace(configured_login_email_backends=configured_backends),
+    )
+    monkeypatch.setattr(
+        handlers,
         "get_domain_backends",
-        AsyncMock(return_value={"mail.example.com": "cloudflare"}),
+        AsyncMock(return_value={"mail.example.com": current_backend}),
     )
     switch = AsyncMock()
     monkeypatch.setattr(handlers, "set_domain_backend", switch)
@@ -227,7 +245,7 @@ def test_telegram_domain_button_switches_the_reader_backend(monkeypatch) -> None
         )
     )
 
-    switch.assert_awaited_once_with(session, "mail.example.com", "gmail")
+    switch.assert_awaited_once_with(session, "mail.example.com", expected_backend)
     callback.answer.assert_awaited_once()
     message.edit_text.assert_awaited_once()
 

@@ -93,8 +93,7 @@ from app.services.backups import create_database_backup_async
 from app.services.crypto import decrypt_text
 from app.services.jobs import add_job_item, create_job, finish_job
 from app.services.login_email_protection import (
-    EMAIL_BACKEND_CLOUDFLARE,
-    EMAIL_BACKEND_GMAIL,
+    EMAIL_BACKEND_ORDER,
     add_available_domain,
     delete_available_domain,
     email_backend_label,
@@ -2352,7 +2351,7 @@ async def login_email_guard_view(
         f"当前域名：@{selected_domain}" if selected_domain else "当前域名：未配置",
         f"实时监听：{'运行中' if client_pool.service_monitor_running else '未运行'}",
         f"自动保护账号：{len(protected_connected_ids)}/{len(active_account_ids)}",
-        f"候选域名：{len(domains)} 个（可分别选择 CF TempMail / Gmail）",
+        f"候选域名：{len(domains)} 个（可分别选择 CF / Gmail / 自建 TempMail）",
         f"白名单账号：{len(whitelisted_ids)} 个",
         f"保护事件：{event_count or 0} 条",
         "",
@@ -2361,7 +2360,7 @@ async def login_email_guard_view(
     if not settings.login_email_protection_enabled:
         lines.extend(["", "提示：环境变量中的自动保护开关当前为关闭状态。"])
     elif not credentials_ready:
-        lines.extend(["", "提示：至少配置 Cloudflare Webhook secret 或 Gmail IMAP 凭据。"])
+        lines.extend(["", "提示：至少配置一个 Cloudflare、Gmail 或自建 TempMail 后端。"])
     elif not domains or not selected_domain:
         lines.extend(["", "提示：至少需要配置并选中一个登录邮箱域名。"])
     elif not client_pool.monitor_enabled:
@@ -2385,8 +2384,8 @@ async def login_email_domains_view(session: AsyncSession) -> tuple[str, InlineKe
     selected = await get_selected_domain(session)
     lines = [
         "邮箱域名管理",
-        "点击域名可设为默认；点击右侧接收方式可在 CF TempMail 与 Gmail 间切换。",
-        "Cloudflare Email Routing 的实际 Catch-all 目标必须与这里一致。",
+        "点击域名可设为默认；点击右侧接收方式可在已配置后端间切换。",
+        "域名的实际收信服务必须与这里选择的后端一致。",
         "",
     ]
     lines.extend(
@@ -2518,11 +2517,22 @@ async def login_email_guard_callback(
                 await callback.answer("域名配置已变化，请重新打开", show_alert=True)
                 return
             current_backend = domain_backends[domain]
-            target_backend = (
-                EMAIL_BACKEND_GMAIL
-                if current_backend == EMAIL_BACKEND_CLOUDFLARE
-                else EMAIL_BACKEND_CLOUDFLARE
-            )
+            available_backends = [
+                backend
+                for backend in EMAIL_BACKEND_ORDER
+                if backend in settings.configured_login_email_backends
+            ]
+            if not available_backends:
+                await callback.answer("尚未配置任何接收后端", show_alert=True)
+                return
+            if current_backend not in available_backends:
+                target_backend = available_backends[0]
+            elif len(available_backends) == 1:
+                await callback.answer("当前已经是唯一可用的接收后端", show_alert=True)
+                return
+            else:
+                current_index = available_backends.index(current_backend)
+                target_backend = available_backends[(current_index + 1) % len(available_backends)]
             try:
                 await set_domain_backend(session, domain, target_backend)
             except ValueError as exc:

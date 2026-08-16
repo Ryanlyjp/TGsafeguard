@@ -494,13 +494,20 @@ def test_resumed_email_wait_does_not_request_another_code(monkeypatch) -> None:
 def test_email_timeout_sends_one_code_request_and_never_auto_retries(monkeypatch) -> None:
     protector = LoginEmailProtector.__new__(LoginEmailProtector)
     protector._gmail_slots = asyncio.Semaphore(1)
+    prepare_mailbox = AsyncMock()
     protector.reader = SimpleNamespace(
-        wait_for_code=AsyncMock(side_effect=TimeoutError("late mail"))
+        prepare_mailbox=prepare_mailbox,
+        wait_for_code=AsyncMock(side_effect=TimeoutError("late mail")),
     )
     protector._window_summary = AsyncMock(return_value="summary")
-    protector._set_event_status = AsyncMock()
+    call_order: list[str] = []
+    protector._set_event_status = AsyncMock(
+        side_effect=lambda event_id, status, **kwargs: call_order.append(f"status:{status}")
+    )
     protector._notify = AsyncMock()
-    send_code = AsyncMock(return_value={"length": 6})
+    send_code = AsyncMock(
+        side_effect=lambda client, email: call_order.append("send") or {"length": 6}
+    )
     monkeypatch.setattr(login_email_protection.account_ops, "send_login_email_code", send_code)
     monkeypatch.setattr(settings, "login_email_poll_timeout_seconds", 300)
 
@@ -514,9 +521,11 @@ def test_email_timeout_sends_one_code_request_and_never_auto_retries(monkeypatch
         )
     )
 
+    prepare_mailbox.assert_awaited_once_with("alias@mail.example.com")
     send_code.assert_awaited_once()
     protector.reader.wait_for_code.assert_awaited_once()
     assert protector._set_event_status.await_count == 2
+    assert call_order[:2] == ["status:waiting_email", "send"]
     assert "5 分钟内未收到" in protector._notify.await_args.args[0]
 
 

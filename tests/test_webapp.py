@@ -2,20 +2,28 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
+import json
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
+from aiohttp.test_utils import TestClient, TestServer
 
 from app.services.login_email_protection import parse_login_email_window_hours
 from app.services.pagination import require_account_capacity
 from app.webapp.server import (
     account_pagination,
+    create_webhook_app,
     create_webapp,
     qr_login_payload,
     reusable_phone_login,
+    start_webapp,
 )
 
 
@@ -103,6 +111,129 @@ def test_mini_app_registers_account_delete_route() -> None:
     ]
 
     assert len(delete_routes) == 1
+
+
+def test_selfhosted_webhook_verifies_hmac_and_routes_exact_domain(monkeypatch) -> None:
+    secret = "s" * 32
+    timestamp = str(int(time.time()))
+    delivery_id = str(uuid.uuid4())
+    payload = {
+        "id": "mail-1",
+        "to": "alias@mail.example.com",
+        "from": "noreply@telegram.org",
+        "subject": "Your Code - 853353",
+        "parsedText": "Your code is 853353 for Login",
+        "receivedAt": "2026-08-16T12:00:02Z",
+    }
+    raw_body = json.dumps(payload, separators=(",", ":")).encode()
+    signature = hmac.new(
+        secret.encode(), timestamp.encode() + b"." + raw_body, hashlib.sha256
+    ).hexdigest()
+    stored = AsyncMock(return_value=1)
+    notified = Mock()
+
+    class Sessionmaker:
+        def __call__(self):
+            class Context:
+                async def __aenter__(self):
+                    return SimpleNamespace()
+
+                async def __aexit__(self, exc_type, exc, traceback):
+                    return False
+
+            return Context()
+
+    monkeypatch.setattr(
+        "app.config.settings.login_email_selfhosted_webhook_secret", secret
+    )
+    monkeypatch.setattr(
+        "app.webapp.server.get_domain_backends",
+        AsyncMock(return_value={"mail.example.com": "selfhosted"}),
+    )
+    monkeypatch.setattr("app.webapp.server.store_temp_mail_payload", stored)
+    monkeypatch.setattr("app.webapp.server.notify_temp_mail_recipient", notified)
+
+    async def exercise() -> None:
+        client = TestClient(TestServer(create_webhook_app(Sessionmaker())))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/webhooks/selfhosted-tempmail",
+                data=raw_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-TempMail-Delivery": delivery_id,
+                    "X-TempMail-Timestamp": timestamp,
+                    "X-TempMail-Signature": signature,
+                },
+            )
+            assert response.status == 200
+            assert await response.json() == {"ok": True, "stored": 1}
+        finally:
+            await client.close()
+
+    asyncio.run(exercise())
+    assert stored.await_args.kwargs["allowed_domains"] == {"mail.example.com"}
+    notified.assert_called_once_with("alias@mail.example.com")
+
+
+def test_selfhosted_webhook_rejects_bad_signature_before_database(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.config.settings.login_email_selfhosted_webhook_secret", "s" * 32
+    )
+
+    async def exercise() -> None:
+        client = TestClient(TestServer(create_webhook_app(None)))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/webhooks/selfhosted-tempmail",
+                json={"id": "mail-1", "to": "alias@mail.example.com"},
+                headers={
+                    "X-TempMail-Delivery": str(uuid.uuid4()),
+                    "X-TempMail-Timestamp": str(int(time.time())),
+                    "X-TempMail-Signature": "0" * 64,
+                },
+            )
+            assert response.status == 401
+        finally:
+            await client.close()
+
+    asyncio.run(exercise())
+
+
+def test_selfhosted_webhook_starts_without_enabling_mini_app(monkeypatch) -> None:
+    started: list[object] = []
+
+    class Runner:
+        def __init__(self, app):
+            self.app = app
+
+        async def setup(self):
+            return None
+
+    class Site:
+        def __init__(self, runner, host, port):
+            started.append((runner, host, port))
+
+        async def start(self):
+            return None
+
+    monkeypatch.setattr("app.config.settings.mini_app_enabled", False)
+    monkeypatch.setattr("app.config.settings.temp_mail_webhook_secret", "")
+    monkeypatch.setattr(
+        "app.config.settings.login_email_selfhosted_webhook_secret", "s" * 32
+    )
+    monkeypatch.setattr("app.webapp.server.web.AppRunner", Runner)
+    monkeypatch.setattr("app.webapp.server.web.TCPSite", Site)
+
+    runner = asyncio.run(start_webapp(None, None))
+
+    assert runner is not None
+    assert len(started) == 1
+    paths = {route.resource.canonical for route in runner.app.router.routes()}
+    assert "/webhooks/selfhosted-tempmail" in paths
+    assert "/mini-app" not in paths
 
 
 def test_mini_app_actions_enable_compact_view_specific_layout() -> None:

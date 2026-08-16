@@ -130,8 +130,8 @@ async def run_security_health_check(
             "、".join(email_backend_label(item) for item in sorted(required_backends))
             + " 凭据已加载"
             if credentials_ready
-            else "域名使用的 Cloudflare TempMail 或 Gmail 后端凭据不完整",
-            "按域名选择配置 TEMP_MAIL_WEBHOOK_SECRET 或 Gmail IMAP 凭据，然后重启服务。",
+            else "域名使用的 Cloudflare、Gmail 或自建 TempMail 后端凭据不完整",
+            "按域名选择配置对应后端凭据，然后重启服务。",
         )
     )
 
@@ -154,10 +154,10 @@ async def run_security_health_check(
             _check(
                 "邮件接收链路实测",
                 mail_reader_ok and not mail_reader_error,
-                "当前域名使用到的 Cloudflare TempMail / Gmail 后端均可用"
+                "当前域名使用到的邮件接收后端均可用"
                 if mail_reader_ok and not mail_reader_error
                 else f"检测失败：{mail_reader_error or '未知错误'}",
-                "检查所选后端的 Webhook 数据表或 Gmail IMAP 凭据，并查看服务日志。",
+                "检查所选后端的 Webhook、IMAP 或自建 TempMail API，并查看服务日志。",
             )
         )
     else:
@@ -165,7 +165,7 @@ async def run_security_health_check(
             _warning(
                 "邮件接收链路实测",
                 "因所需后端凭据不完整而跳过",
-                "先配置域名选择对应的 Cloudflare 或 Gmail 凭据，再重新点击检测。",
+                "先配置域名选择对应的接收后端凭据，再重新点击检测。",
             )
         )
 

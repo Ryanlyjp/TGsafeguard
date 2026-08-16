@@ -7,6 +7,7 @@ import logging
 import re
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email import policy
@@ -16,6 +17,7 @@ from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
+import aiohttp
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -35,6 +37,10 @@ from app.db.models import (
     TgAccount,
 )
 from app.services.crypto import decrypt_text, encrypt_text
+from app.services.temp_mail import (
+    release_temp_mail_message_event,
+    temp_mail_message_event,
+)
 from app.tg import account_ops
 
 logger = logging.getLogger(__name__)
@@ -44,9 +50,16 @@ DOMAINS_KEY = "login_email_protection.domains"
 DOMAIN_BACKENDS_KEY = "login_email_protection.domain_backends"
 EMAIL_BACKEND_CLOUDFLARE = "cloudflare"
 EMAIL_BACKEND_GMAIL = "gmail"
+EMAIL_BACKEND_SELFHOSTED = "selfhosted"
+EMAIL_BACKEND_ORDER = (
+    EMAIL_BACKEND_CLOUDFLARE,
+    EMAIL_BACKEND_GMAIL,
+    EMAIL_BACKEND_SELFHOSTED,
+)
 EMAIL_BACKEND_LABELS = {
     EMAIL_BACKEND_CLOUDFLARE: "Cloudflare TempMail",
     EMAIL_BACKEND_GMAIL: "Gmail",
+    EMAIL_BACKEND_SELFHOSTED: "自建 TempMail",
 }
 DOMAIN_PATTERN = re.compile(
     r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
@@ -401,6 +414,26 @@ class TempMailCodeReader:
             return None
         return body_match.group(1)
 
+    async def find_code(self, target_email: str, requested_at: datetime) -> str | None:
+        async with self.sessionmaker() as session:
+            messages = list(
+                (
+                    await session.scalars(
+                        select(TempMailMessage)
+                        .where(
+                            TempMailMessage.recipient == target_email.lower(),
+                            TempMailMessage.received_at >= requested_at,
+                        )
+                        .order_by(TempMailMessage.received_at.desc())
+                        .limit(100)
+                    )
+                ).all()
+            )
+        for message in messages:
+            if code := self._extract_code(message, target_email):
+                return code
+        return None
+
     async def wait_for_code(
         self,
         target_email: str,
@@ -416,26 +449,238 @@ class TempMailCodeReader:
             requested_at = requested_at.replace(tzinfo=UTC)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            async with self.sessionmaker() as session:
-                messages = list(
-                    (
-                        await session.scalars(
-                            select(TempMailMessage)
-                            .where(
-                                TempMailMessage.recipient == target_email.lower(),
-                                TempMailMessage.received_at >= requested_at,
-                            )
-                            .order_by(TempMailMessage.received_at.desc())
-                            .limit(100)
-                        )
-                    ).all()
-                )
-            for message in messages:
-                if code := self._extract_code(message, target_email):
-                    return code
+            if code := await self.find_code(target_email, requested_at):
+                return code
             await asyncio.sleep(
                 min(settings.login_email_poll_interval_seconds, max(0, deadline - time.monotonic()))
             )
+        raise TimeoutError("等待 Telegram 登录邮箱验证码超时")
+
+
+class SelfHostedTempMailCodeReader:
+    def __init__(self, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
+        self.base_url = settings.login_email_selfhosted_tempmail_url
+        self.headers = {
+            "Authorization": f"Bearer {settings.login_email_selfhosted_tempmail_api_key}"
+        }
+        self.stored_reader = TempMailCodeReader(sessionmaker)
+
+    @staticmethod
+    async def _json_response(
+        response: aiohttp.ClientResponse,
+        operation: str,
+    ) -> Mapping[str, object]:
+        if response.status >= 400:
+            detail = (await response.text())[:300]
+            raise RuntimeError(
+                f"自建 TempMail {operation}失败（HTTP {response.status}）：{detail}"
+            )
+        try:
+            payload = await response.json(content_type=None)
+        except (json.JSONDecodeError, aiohttp.ContentTypeError) as exc:
+            raise RuntimeError(f"自建 TempMail {operation}返回了无效 JSON") from exc
+        if not isinstance(payload, Mapping):
+            raise RuntimeError(f"自建 TempMail {operation}返回格式无效")
+        return payload
+
+    async def _lookup_mailbox(
+        self,
+        session: aiohttp.ClientSession,
+        target_email: str,
+    ) -> Mapping[str, object] | None:
+        async with session.get(
+            f"{self.base_url}/api/mailboxes/lookup",
+            headers=self.headers,
+            params={"address": target_email.lower()},
+        ) as response:
+            if response.status == 404:
+                return None
+            payload = await self._json_response(response, "查找邮箱")
+        mailbox = payload.get("mailbox")
+        if not isinstance(mailbox, Mapping):
+            raise RuntimeError("自建 TempMail 查找邮箱响应缺少 mailbox")
+        if str(mailbox.get("full_address") or "").lower() != target_email.lower():
+            raise RuntimeError("自建 TempMail 返回的邮箱地址与目标地址不一致")
+        if not str(mailbox.get("id") or ""):
+            raise RuntimeError("自建 TempMail 查找邮箱响应缺少 mailbox.id")
+        return mailbox
+
+    async def validate_connection(self) -> None:
+        if not self.base_url or not settings.login_email_selfhosted_tempmail_api_key:
+            raise RuntimeError("自建 TempMail URL 或 API Key 未配置")
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                f"{self.base_url}/api/me",
+                headers=self.headers,
+            ) as response:
+                await self._json_response(response, "连接检查")
+
+    async def prepare_mailbox(self, target_email: str) -> None:
+        local_part, domain = target_email.lower().rsplit("@", 1)
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            if await self._lookup_mailbox(session, target_email) is not None:
+                return
+            async with session.post(
+                f"{self.base_url}/api/mailboxes",
+                headers=self.headers,
+                json={
+                    "address": local_part,
+                    "domain": domain,
+                    "subdomain_mode": "off",
+                    "source": "tgmag",
+                },
+            ) as response:
+                if response.status == 409:
+                    mailbox = await self._lookup_mailbox(session, target_email)
+                    if mailbox is not None:
+                        return
+                payload = await self._json_response(response, "创建邮箱")
+            mailbox = payload.get("mailbox")
+            if not isinstance(mailbox, Mapping):
+                raise RuntimeError("自建 TempMail 创建邮箱响应缺少 mailbox")
+            if str(mailbox.get("full_address") or "").lower() != target_email.lower():
+                raise RuntimeError("自建 TempMail 创建的邮箱地址与目标地址不一致")
+
+    @staticmethod
+    def _received_at(value: object) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
+    @staticmethod
+    def _extract_code(email_payload: Mapping[str, object], target_email: str) -> str | None:
+        raw_message = email_payload.get("raw_message")
+        if isinstance(raw_message, str) and raw_message:
+            parsed = parse_telegram_login_email(
+                raw_message.encode("utf-8"),
+                target_email,
+                settings.login_email_sender,
+            )
+            if parsed is not None:
+                return parsed.code
+
+        sender = str(email_payload.get("sender") or "")
+        senders = {address.lower() for _, address in getaddresses([sender]) if address}
+        if settings.login_email_sender.lower() not in senders:
+            return None
+        subject = str(email_payload.get("subject") or "")
+        body = str(email_payload.get("body_text") or email_payload.get("body_html") or "")
+        combined = f"{subject}\n{body}"
+        if not EMAIL_LOGIN_PURPOSE_PATTERN.search(combined):
+            return None
+        body_match = EMAIL_BODY_CODE_PATTERN.search(body)
+        subject_match = EMAIL_SUBJECT_CODE_PATTERN.search(subject)
+        if body_match is None:
+            return None
+        if subject_match is not None and subject_match.group(1) != body_match.group(1):
+            return None
+        return body_match.group(1)
+
+    async def _poll_api_for_code(
+        self,
+        session: aiohttp.ClientSession,
+        target_email: str,
+        requested_at: datetime,
+    ) -> str | None:
+        mailbox = await self._lookup_mailbox(session, target_email)
+        if mailbox is None:
+            return None
+        mailbox_id = str(mailbox["id"])
+        async with session.get(
+            f"{self.base_url}/api/mailboxes/{mailbox_id}/emails",
+            headers=self.headers,
+            params={"page": 1, "size": 100},
+        ) as response:
+            payload = await self._json_response(response, "列出邮件")
+        messages = payload.get("data")
+        if not isinstance(messages, list):
+            raise RuntimeError("自建 TempMail 邮件列表响应缺少 data")
+        for summary in messages:
+            if not isinstance(summary, Mapping):
+                continue
+            received_at = self._received_at(summary.get("received_at"))
+            if received_at is None or received_at < requested_at:
+                continue
+            email_id = str(summary.get("id") or "")
+            if not email_id:
+                continue
+            async with session.get(
+                f"{self.base_url}/api/mailboxes/{mailbox_id}/emails/{email_id}",
+                headers=self.headers,
+            ) as response:
+                detail = await self._json_response(response, "读取邮件")
+            email_payload = detail.get("email")
+            if isinstance(email_payload, Mapping):
+                if code := self._extract_code(email_payload, target_email):
+                    return code
+        return None
+
+    async def wait_for_code(
+        self,
+        target_email: str,
+        requested_at: datetime,
+        timeout_seconds: float | None = None,
+    ) -> str:
+        timeout = (
+            settings.login_email_poll_timeout_seconds
+            if timeout_seconds is None
+            else max(0, timeout_seconds)
+        )
+        if requested_at.tzinfo is None:
+            requested_at = requested_at.replace(tzinfo=UTC)
+        requested_at = requested_at.astimezone(UTC)
+        deadline = time.monotonic() + timeout
+        request_timeout = aiohttp.ClientTimeout(total=30)
+        message_event = temp_mail_message_event(target_email)
+        api_error_logged = False
+        try:
+            async with aiohttp.ClientSession(timeout=request_timeout) as session:
+                while time.monotonic() < deadline:
+                    message_event.clear()
+                    if code := await self.stored_reader.find_code(target_email, requested_at):
+                        logger.info(
+                            "Matched login email code source=webhook domain=%s",
+                            target_email.rsplit("@", 1)[-1],
+                        )
+                        return code
+                    try:
+                        if code := await self._poll_api_for_code(
+                            session, target_email, requested_at
+                        ):
+                            logger.info(
+                                "Matched login email code source=polling domain=%s",
+                                target_email.rsplit("@", 1)[-1],
+                            )
+                            return code
+                        api_error_logged = False
+                    except (aiohttp.ClientError, RuntimeError, TimeoutError) as exc:
+                        if not api_error_logged:
+                            logger.warning(
+                                "Self-hosted TempMail API polling failed; continuing to wait "
+                                "for webhook delivery: %s",
+                                exc,
+                            )
+                            api_error_logged = True
+                    try:
+                        await asyncio.wait_for(
+                            message_event.wait(),
+                            timeout=min(
+                                settings.login_email_poll_interval_seconds,
+                                max(0, deadline - time.monotonic()),
+                            ),
+                        )
+                    except TimeoutError:
+                        pass
+        finally:
+            release_temp_mail_message_event(target_email, message_event)
         raise TimeoutError("等待 Telegram 登录邮箱验证码超时")
 
 
@@ -447,7 +692,19 @@ class RoutedCodeReader:
         self.readers = {
             EMAIL_BACKEND_CLOUDFLARE: TempMailCodeReader(sessionmaker),
             EMAIL_BACKEND_GMAIL: GmailCodeReader(),
+            EMAIL_BACKEND_SELFHOSTED: SelfHostedTempMailCodeReader(sessionmaker),
         }
+
+    async def prepare_mailbox(self, target_email: str) -> None:
+        try:
+            _, domain = target_email.lower().rsplit("@", 1)
+        except ValueError as exc:
+            raise ValueError("目标邮箱地址格式无效") from exc
+        async with self.sessionmaker() as session:
+            backend = await get_domain_backend(session, domain)
+        if backend == EMAIL_BACKEND_SELFHOSTED:
+            reader = self.readers[backend]
+            await reader.prepare_mailbox(target_email)
 
     async def validate_connection(self) -> None:
         async with self.sessionmaker() as session:
@@ -577,11 +834,17 @@ async def set_domain_backend(session: AsyncSession, domain: str, backend: str) -
     if normalized_domain not in await get_available_domains(session):
         raise ValueError("邮箱域名不在当前允许列表中")
     if normalized_backend not in settings.configured_login_email_backends:
-        missing = (
-            "TEMP_MAIL_WEBHOOK_SECRET"
-            if normalized_backend == EMAIL_BACKEND_CLOUDFLARE
-            else "LOGIN_EMAIL_GMAIL_USERNAME / LOGIN_EMAIL_GMAIL_APP_PASSWORD"
-        )
+        missing_by_backend = {
+            EMAIL_BACKEND_CLOUDFLARE: "TEMP_MAIL_WEBHOOK_SECRET",
+            EMAIL_BACKEND_GMAIL: (
+                "LOGIN_EMAIL_GMAIL_USERNAME / LOGIN_EMAIL_GMAIL_APP_PASSWORD"
+            ),
+            EMAIL_BACKEND_SELFHOSTED: (
+                "LOGIN_EMAIL_SELFHOSTED_TEMPMAIL_URL / "
+                "LOGIN_EMAIL_SELFHOSTED_TEMPMAIL_API_KEY"
+            ),
+        }
+        missing = missing_by_backend[normalized_backend]
         raise ValueError(f"{email_backend_label(normalized_backend)} 尚未配置：缺少 {missing}")
     routes = await get_domain_backends(session)
     routes[normalized_domain] = normalized_backend
@@ -1069,7 +1332,7 @@ class LoginEmailProtector:
             return (
                 f"卡点：Telegram 已受理发码，但所选邮件接收链路在 {minutes} 分钟内"
                 "未收到匹配的验证码邮件。请按该域名配置检查 Cloudflare TempMail Webhook "
-                "投递记录，或 Gmail 转发/IMAP 状态及收件地址。"
+                "投递记录、Gmail 转发/IMAP 状态，或自建 TempMail 收信/API 状态。"
                 "本次请求未自动重发，请等待投递恢复后再手动重试"
             )
         return str(exc)
@@ -1140,17 +1403,20 @@ class LoginEmailProtector:
         summary = await self._window_summary(event_id)
         try:
             if requested_at is None:
-                await account_ops.send_login_email_code(client, target_email)
+                prepare_mailbox = getattr(self.reader, "prepare_mailbox", None)
+                if prepare_mailbox is not None:
+                    await prepare_mailbox(target_email)
                 requested_at = datetime.now(UTC)
-                logger.info(
-                    "Requested one login email verification code for event %s account %s",
-                    event_id,
-                    account_id,
-                )
                 await self._set_event_status(
                     event_id,
                     "waiting_email",
                     email_requested_at=requested_at,
+                )
+                await account_ops.send_login_email_code(client, target_email)
+                logger.info(
+                    "Requested one login email verification code for event %s account %s",
+                    event_id,
+                    account_id,
                 )
             async with self._gmail_slots:
                 code = await self.reader.wait_for_code(

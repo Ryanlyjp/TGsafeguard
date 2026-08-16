@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
+import json
 import logging
 import secrets
 import tempfile
@@ -50,6 +53,7 @@ from app.services.crypto import decrypt_text, encrypt_text
 from app.services.jobs import add_job_item, create_job, finish_job
 from app.services.login_email_protection import (
     EMAIL_BACKEND_CLOUDFLARE,
+    EMAIL_BACKEND_SELFHOSTED,
     format_wait_deadline,
     get_domain_backends,
     login_email_wait_remaining,
@@ -60,7 +64,11 @@ from app.services.qr_code import login_qr_png
 from app.services.rate_limit import RateGate, get_rate, validate_rate_values
 from app.services.security_health import SecurityHealthReport, run_security_health_check
 from app.services.targets import canonicalize_target_ref, require_allowed_target
-from app.services.temp_mail import store_temp_mail_payload
+from app.services.temp_mail import (
+    notify_temp_mail_recipient,
+    parse_allowed_recipients,
+    store_temp_mail_payload,
+)
 from app.tg import account_ops, batch_ops
 from app.tg.client_pool import ClientPool
 from app.webapp.auth import MiniAppUser, require_admin
@@ -158,6 +166,60 @@ async def temp_mail_webhook(request: web.Request) -> web.Response:
             payload,
             allowed_domains=cloudflare_domains,
         )
+    return web.json_response({"ok": True, "stored": stored})
+
+
+async def selfhosted_temp_mail_webhook(request: web.Request) -> web.Response:
+    secret = settings.login_email_selfhosted_webhook_secret
+    if not secret:
+        raise web.HTTPServiceUnavailable(text="webhook is not configured")
+    timestamp = request.headers.get("X-TempMail-Timestamp", "")
+    signature = request.headers.get("X-TempMail-Signature", "")
+    delivery_id = request.headers.get("X-TempMail-Delivery", "")
+    try:
+        sent_at = int(timestamp)
+        uuid.UUID(delivery_id)
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise web.HTTPUnauthorized(text="invalid webhook headers") from exc
+    if abs(int(time.time()) - sent_at) > 300:
+        raise web.HTTPUnauthorized(text="expired webhook timestamp")
+    if request.content_type != "application/json":
+        raise web.HTTPUnsupportedMediaType(text="application/json required")
+    raw_body = await request.read()
+    expected = hmac.new(
+        secret.encode("utf-8"),
+        timestamp.encode("utf-8") + b"." + raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise web.HTTPUnauthorized(text="invalid webhook signature")
+    try:
+        payload = json.loads(raw_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise web.HTTPBadRequest(text="invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise web.HTTPBadRequest(text="JSON object required")
+
+    sessionmaker = request.app["sessionmaker"]
+    async with sessionmaker() as session:
+        routes = await get_domain_backends(session)
+        selfhosted_domains = frozenset(
+            domain
+            for domain, backend in routes.items()
+            if backend == EMAIL_BACKEND_SELFHOSTED
+        )
+        recipients = parse_allowed_recipients(payload.get("to"), selfhosted_domains)
+        if not recipients:
+            raise web.HTTPUnprocessableEntity(
+                text="recipient is not configured for self-hosted TempMail"
+            )
+        stored = await store_temp_mail_payload(
+            session,
+            payload,
+            allowed_domains=selfhosted_domains,
+        )
+    for recipient, _ in recipients:
+        notify_temp_mail_recipient(recipient)
     return web.json_response({"ok": True, "stored": stored})
 
 
@@ -1770,6 +1832,9 @@ async def create_webapp(
     app["pending_login_email"] = {}
     app.on_cleanup.append(cleanup_pending_logins)
     app.router.add_post("/webhooks/temp-mail", temp_mail_webhook)
+    app.router.add_post(
+        "/webhooks/selfhosted-tempmail", selfhosted_temp_mail_webhook
+    )
     app.router.add_get("/mini-app", index)
     app.router.add_get("/mini-app/", index)
     app.router.add_static("/mini-app/static", STATIC_DIR)
@@ -1816,13 +1881,36 @@ async def create_webapp(
     return app
 
 
+def create_webhook_app(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> web.Application:
+    app = web.Application(
+        middlewares=[error_middleware, security_headers_middleware],
+        client_max_size=MAX_REQUEST_SIZE,
+    )
+    app["sessionmaker"] = sessionmaker
+    app.router.add_post("/webhooks/temp-mail", temp_mail_webhook)
+    app.router.add_post(
+        "/webhooks/selfhosted-tempmail", selfhosted_temp_mail_webhook
+    )
+    return app
+
+
 async def start_webapp(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> web.AppRunner | None:
-    if not settings.mini_app_enabled:
+    webhook_enabled = bool(
+        settings.temp_mail_webhook_secret
+        or settings.login_email_selfhosted_webhook_secret
+    )
+    if not settings.mini_app_enabled and not webhook_enabled:
         return None
-    app = await create_webapp(sessionmaker, client_pool)
+    app = (
+        await create_webapp(sessionmaker, client_pool)
+        if settings.mini_app_enabled
+        else create_webhook_app(sessionmaker)
+    )
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, settings.mini_app_host, settings.mini_app_port)

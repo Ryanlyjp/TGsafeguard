@@ -20,3 +20,5 @@ data/backups/
 *.sqlite*
 *.7z
 *.log
+progress.md
+docs/hugh-nl-deployment.md

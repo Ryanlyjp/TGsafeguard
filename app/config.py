@@ -5,6 +5,7 @@ import re
 from functools import cached_property
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -16,13 +17,14 @@ EMAIL_BACKEND_ALIASES = {
     "temp-mail": "cloudflare",
     "tempmail": "cloudflare",
     "gmail": "gmail",
+    "selfhosted": "selfhosted",
 }
 
 
 def normalize_email_backend(value: str) -> str:
     normalized = EMAIL_BACKEND_ALIASES.get(value.strip().lower())
     if normalized is None:
-        raise ValueError("email backend must be cloudflare or gmail")
+        raise ValueError("email backend must be cloudflare, gmail, or selfhosted")
     return normalized
 
 
@@ -74,13 +76,22 @@ class Settings(BaseSettings):
     temp_mail_webhook_secret: str = Field(default="", alias="TEMP_MAIL_WEBHOOK_SECRET")
     login_email_gmail_username: str = Field(default="", alias="LOGIN_EMAIL_GMAIL_USERNAME")
     login_email_gmail_app_password: str = Field(default="", alias="LOGIN_EMAIL_GMAIL_APP_PASSWORD")
+    login_email_selfhosted_tempmail_url: str = Field(
+        default="", alias="LOGIN_EMAIL_SELFHOSTED_TEMPMAIL_URL"
+    )
+    login_email_selfhosted_tempmail_api_key: str = Field(
+        default="", alias="LOGIN_EMAIL_SELFHOSTED_TEMPMAIL_API_KEY"
+    )
+    login_email_selfhosted_webhook_secret: str = Field(
+        default="", alias="LOGIN_EMAIL_SELFHOSTED_WEBHOOK_SECRET"
+    )
     login_email_imap_host: str = Field(default="imap.gmail.com", alias="LOGIN_EMAIL_IMAP_HOST")
     login_email_imap_port: int = Field(default=993, ge=1, le=65535, alias="LOGIN_EMAIL_IMAP_PORT")
     login_email_imap_folder: str = Field(default="INBOX", alias="LOGIN_EMAIL_IMAP_FOLDER")
     login_email_sender: str = Field(default="noreply@telegram.org", alias="LOGIN_EMAIL_SENDER")
     login_email_poll_timeout_seconds: int = Field(default=300, ge=30, le=7200, alias="LOGIN_EMAIL_POLL_TIMEOUT_SECONDS")
     login_email_poll_interval_seconds: int = Field(default=3, ge=1, le=30, alias="LOGIN_EMAIL_POLL_INTERVAL_SECONDS")
-    login_email_catchup_seconds: int = Field(default=180, ge=0, le=3600, alias="LOGIN_EMAIL_CATCHUP_SECONDS")
+    login_email_catchup_seconds: int = Field(default=600, ge=0, le=3600, alias="LOGIN_EMAIL_CATCHUP_SECONDS")
 
     @field_validator("admin_ids", mode="before")
     @classmethod
@@ -131,6 +142,40 @@ class Settings(BaseSettings):
     def normalize_gmail_app_password(cls, value: str) -> str:
         return "".join(value.split())
 
+    @field_validator("login_email_selfhosted_tempmail_url")
+    @classmethod
+    def normalize_selfhosted_tempmail_url(cls, value: str) -> str:
+        url = value.strip().rstrip("/")
+        if not url:
+            return ""
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(
+                "LOGIN_EMAIL_SELFHOSTED_TEMPMAIL_URL must be an http(s) base URL"
+            )
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError(
+                "LOGIN_EMAIL_SELFHOSTED_TEMPMAIL_URL must not contain credentials, "
+                "query, or fragment"
+            )
+        return url
+
+    @field_validator("login_email_selfhosted_tempmail_api_key")
+    @classmethod
+    def normalize_selfhosted_tempmail_api_key(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("login_email_selfhosted_webhook_secret")
+    @classmethod
+    def validate_selfhosted_webhook_secret(cls, value: str) -> str:
+        secret = value.strip()
+        if secret and (len(secret) < 32 or any(character.isspace() for character in secret)):
+            raise ValueError(
+                "LOGIN_EMAIL_SELFHOSTED_WEBHOOK_SECRET must be at least 32 "
+                "non-whitespace characters"
+            )
+        return secret
+
     @field_validator("temp_mail_webhook_secret")
     @classmethod
     def validate_temp_mail_webhook_secret(cls, value: str) -> str:
@@ -156,11 +201,21 @@ class Settings(BaseSettings):
                     "LOGIN_EMAIL_GMAIL_USERNAME and LOGIN_EMAIL_GMAIL_APP_PASSWORD "
                     "must be configured together"
                 )
-            cloudflare_configured = bool(self.temp_mail_webhook_secret)
-            if not gmail_configured and not cloudflare_configured:
+            selfhosted_values = (
+                self.login_email_selfhosted_tempmail_url,
+                self.login_email_selfhosted_tempmail_api_key,
+            )
+            selfhosted_configured = all(selfhosted_values)
+            if any(selfhosted_values) and not selfhosted_configured:
                 raise ValueError(
-                    "login email protection requires Gmail credentials or "
-                    "TEMP_MAIL_WEBHOOK_SECRET"
+                    "LOGIN_EMAIL_SELFHOSTED_TEMPMAIL_URL and "
+                    "LOGIN_EMAIL_SELFHOSTED_TEMPMAIL_API_KEY must be configured together"
+                )
+            cloudflare_configured = bool(self.temp_mail_webhook_secret)
+            if not gmail_configured and not cloudflare_configured and not selfhosted_configured:
+                raise ValueError(
+                    "login email protection requires Cloudflare, Gmail, or self-hosted "
+                    "TempMail credentials"
                 )
             domains = set(self.login_email_alias_domains)
             for domain, backend in self.login_email_domain_backends.items():
@@ -173,6 +228,11 @@ class Settings(BaseSettings):
                     raise ValueError(f"Gmail credentials are required for domain: {domain}")
                 if backend == "cloudflare" and not cloudflare_configured:
                     raise ValueError(f"TEMP_MAIL_WEBHOOK_SECRET is required for domain: {domain}")
+                if backend == "selfhosted" and not selfhosted_configured:
+                    raise ValueError(
+                        "Self-hosted TempMail URL and API key are required for domain: "
+                        f"{domain}"
+                    )
         return self
 
     @cached_property
@@ -201,12 +261,19 @@ class Settings(BaseSettings):
             backends.add("cloudflare")
         if self.login_email_gmail_username and self.login_email_gmail_app_password:
             backends.add("gmail")
+        if (
+            self.login_email_selfhosted_tempmail_url
+            and self.login_email_selfhosted_tempmail_api_key
+        ):
+            backends.add("selfhosted")
         return frozenset(backends)
 
     @property
     def default_login_email_backend(self) -> str:
         if "cloudflare" in self.configured_login_email_backends:
             return "cloudflare"
+        if "selfhosted" in self.configured_login_email_backends:
+            return "selfhosted"
         return "gmail"
 
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from email.utils import getaddresses
 from typing import Any
 
@@ -13,6 +15,28 @@ from app.config import settings
 from app.db.models import TempMailMessage
 
 ALLOWED_TEMP_MAIL_DOMAINS = frozenset(settings.login_email_alias_domains)
+_message_events: dict[str, asyncio.Event] = {}
+
+
+def temp_mail_message_event(recipient: str) -> asyncio.Event:
+    normalized = recipient.strip().lower()
+    event = _message_events.get(normalized)
+    if event is None:
+        event = asyncio.Event()
+        _message_events[normalized] = event
+    return event
+
+
+def notify_temp_mail_recipient(recipient: str) -> None:
+    event = _message_events.get(recipient.strip().lower())
+    if event is not None:
+        event.set()
+
+
+def release_temp_mail_message_event(recipient: str, event: asyncio.Event) -> None:
+    normalized = recipient.strip().lower()
+    if _message_events.get(normalized) is event:
+        _message_events.pop(normalized, None)
 
 
 def normalize_recipient(
@@ -60,6 +84,18 @@ def _optional_text(value: object) -> str | None:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _received_at(value: object) -> datetime:
+    if not isinstance(value, str):
+        return datetime.now(UTC)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("receivedAt must be an ISO 8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 async def store_temp_mail_payload(
     session: AsyncSession,
     payload: Mapping[str, Any],
@@ -73,6 +109,7 @@ async def store_temp_mail_payload(
     if not recipients:
         return 0
     sender = _optional_text(payload.get("from")) or ""
+    received_at = _received_at(payload.get("receivedAt"))
     rows = [
         {
             "id": message_id,
@@ -87,6 +124,7 @@ async def store_temp_mail_payload(
             "aiExtractType": _optional_text(payload.get("aiExtractType")),
             "aiExtractResult": payload.get("aiExtractResult"),
             "aiExtractResultText": _optional_text(payload.get("aiExtractResultText")),
+            "received_at": received_at,
         }
         for recipient, domain in recipients
     ]
