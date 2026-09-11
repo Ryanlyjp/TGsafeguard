@@ -1126,6 +1126,15 @@ async def api_account_action(request: web.Request) -> web.Response:
         return web.json_response(
             {"ok": True, "message": f"Telegram 777000 服务消息检查完成：新增 {service_inserted} 条"}
         )
+    if action == "rotate_login_email":
+        client = await client_pool.get_client(account_id)
+        target_email = await client_pool.login_email_protector.change_now(account_id, client)
+        return web.json_response(
+            {
+                "ok": True,
+                "message": f"账号 #{account_id} 一键换绑邮箱成功：{target_email}",
+            }
+        )
     if action == "refresh_status":
         client = await client_pool.get_client(account_id)
         async with sessionmaker() as session:

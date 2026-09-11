@@ -19,6 +19,7 @@ from app.services.login_email_protection import parse_login_email_window_hours
 from app.services.pagination import require_account_capacity
 from app.webapp.server import (
     account_pagination,
+    api_account_action,
     create_webhook_app,
     create_webapp,
     qr_login_payload,
@@ -111,6 +112,52 @@ def test_mini_app_registers_account_delete_route() -> None:
     ]
 
     assert len(delete_routes) == 1
+
+
+def test_mini_app_account_action_runs_one_click_login_email_rotation(monkeypatch) -> None:
+    account = SimpleNamespace(id=17)
+    admin = SimpleNamespace(id=3)
+    session = SimpleNamespace(
+        scalar=AsyncMock(return_value=admin),
+        get=AsyncMock(return_value=account),
+        commit=AsyncMock(),
+    )
+
+    class SessionContext:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    client = object()
+    protector = SimpleNamespace(change_now=AsyncMock(return_value="new@mail.example"))
+    client_pool = SimpleNamespace(
+        get_client=AsyncMock(return_value=client),
+        login_email_protector=protector,
+    )
+    request = SimpleNamespace(
+        app={"sessionmaker": lambda: SessionContext(), "client_pool": client_pool},
+        match_info={"account_id": "17"},
+        json=AsyncMock(return_value={"action": "rotate_login_email"}),
+    )
+    audit_mock = AsyncMock()
+    monkeypatch.setattr(
+        "app.webapp.server.authenticated",
+        AsyncMock(return_value=SimpleNamespace(id=9)),
+    )
+    monkeypatch.setattr("app.webapp.server.audit", audit_mock)
+
+    response = asyncio.run(api_account_action(request))
+
+    assert response.status == 200
+    assert json.loads(response.text) == {
+        "ok": True,
+        "message": "账号 #17 一键换绑邮箱成功：new@mail.example",
+    }
+    client_pool.get_client.assert_awaited_once_with(17)
+    protector.change_now.assert_awaited_once_with(17, client)
+    audit_mock.assert_awaited_once()
 
 
 def test_selfhosted_webhook_verifies_hmac_and_routes_exact_domain(monkeypatch) -> None:
@@ -252,6 +299,10 @@ def test_mini_app_actions_enable_compact_view_specific_layout() -> None:
     assert "const ACCOUNT_PAGE_SIZE = 10" in script
     assert 'id="accountPagination"' in index
     assert 'id="deleteAccountBtn"' in script
+    assert 'data-account-action="rotate_login_email">一键换绑邮箱</button>' in script
+    assert script.index('data-account-action="export_session"') < script.index(
+        'data-account-action="rotate_login_email"'
+    )
     assert 'method: "DELETE"' in script
     assert script.count("await confirmAction(`") >= 2
     assert ".account-danger-zone" in styles

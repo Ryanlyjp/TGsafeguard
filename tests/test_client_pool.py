@@ -78,6 +78,36 @@ def test_existing_service_row_still_reaches_protector(monkeypatch) -> None:
     assert session.committed is True
 
 
+def test_non_777000_premium_message_never_reaches_protector() -> None:
+    text = "Thank you for subscribing to Telegram Premium!"
+    record = SimpleNamespace(
+        id=73,
+        text=text,
+        text_preview=text,
+        text_hash="current",
+    )
+    pool = ClientPool.__new__(ClientPool)
+    pool.sessionmaker = FakeSessionmaker(FakeSession(record))
+    pool.bot = SimpleNamespace(send_message=AsyncMock())
+    pool.login_email_protector = SimpleNamespace(record_alert=AsyncMock())
+    pool._service_message_locks = {}
+    pool._protection_tasks = set()
+    pool._is_post_session_login_alert = AsyncMock(return_value=True)
+
+    asyncio.run(
+        pool._ingest_service_message(
+            account_id=4,
+            source_user_id=123456,
+            message_id=99,
+            text=text,
+            received_at=datetime.now(UTC),
+            client=object(),
+        )
+    )
+
+    pool.login_email_protector.record_alert.assert_not_awaited()
+
+
 def test_initial_manual_login_alert_is_stored_without_protection() -> None:
     text = "Login code: 97588. Do not give this code to anyone."
     record = SimpleNamespace(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from telethon.errors import FloodWaitError
@@ -16,6 +16,8 @@ from app.services.login_email_protection import (
     build_alias,
     format_wait_deadline,
     is_login_code_alert,
+    is_login_email_protection_alert,
+    is_premium_notice,
     login_email_wait_remaining,
     normalize_domain,
     parse_telegram_login_email,
@@ -122,6 +124,127 @@ def test_alias_uses_timestamp_and_phone_digits() -> None:
     assert build_alias("+1 202 555 0147", "mail.example.com", 1775550123) == (
         "1775550123_12025550147@mail.example.com"
     )
+
+
+def test_manual_change_now_rotates_without_777000_event(monkeypatch) -> None:
+    account = SimpleNamespace(phone_encrypted="encrypted-phone")
+    security = SimpleNamespace(login_email_encrypted=None)
+    session = AsyncMock()
+    session.__aenter__.return_value = session
+    session.get.side_effect = lambda model, key: (
+        account if model is login_email_protection.TgAccount else security
+    )
+    session.scalars.return_value = SimpleNamespace(all=lambda: [])
+    reader = SimpleNamespace(
+        prepare_mailbox=AsyncMock(),
+        wait_for_code=AsyncMock(return_value="853353"),
+    )
+    protector = LoginEmailProtector.__new__(LoginEmailProtector)
+    protector.sessionmaker = lambda: session
+    protector.reader = reader
+    protector._account_locks = {}
+    protector._change_locks = {}
+    protector._window_waiters = {}
+    protector.manual_email_waits = {}
+    protector._gmail_slots = asyncio.Semaphore(1)
+
+    monkeypatch.setattr(
+        login_email_protection.account_ops,
+        "get_2fa_info",
+        AsyncMock(return_value={"login_email_pattern": "o***@example.com"}),
+    )
+    send_code = AsyncMock()
+    monkeypatch.setattr(login_email_protection.account_ops, "send_login_email_code", send_code)
+    monkeypatch.setattr(
+        login_email_protection.account_ops,
+        "confirm_login_email",
+        AsyncMock(return_value=SimpleNamespace(email="1775550123_12025550147@mail.example.com")),
+    )
+    monkeypatch.setattr(login_email_protection, "decrypt_text", lambda value: "+1 202 555 0147")
+    monkeypatch.setattr(login_email_protection, "encrypt_text", lambda value: f"encrypted:{value}")
+    monkeypatch.setattr(login_email_protection.time, "time", lambda: 1775550123)
+    monkeypatch.setattr(
+        login_email_protection,
+        "get_selected_domain",
+        AsyncMock(return_value="mail.example.com"),
+    )
+
+    target = asyncio.run(protector.change_now(17, "client"))
+
+    assert target == "1775550123_12025550147@mail.example.com"
+    reader.prepare_mailbox.assert_awaited_once_with(target)
+    send_code.assert_awaited_once_with("client", target)
+    reader.wait_for_code.assert_awaited_once()
+    assert security.login_email_encrypted == f"encrypted:{target}"
+    assert all(
+        call.args[0] is not login_email_protection.ServiceMessage
+        for call in session.get.await_args_list
+    )
+
+
+def test_manual_change_now_rejects_account_without_existing_login_email(monkeypatch) -> None:
+    protector = LoginEmailProtector.__new__(LoginEmailProtector)
+    protector._change_locks = {}
+    protector.manual_email_waits = {}
+    protector.sessionmaker = lambda: (_ for _ in ()).throw(AssertionError("database not expected"))
+    monkeypatch.setattr(
+        login_email_protection.account_ops,
+        "get_2fa_info",
+        AsyncMock(return_value={"login_email_pattern": None}),
+    )
+
+    with pytest.raises(ValueError, match="尚未设置登录邮箱"):
+        asyncio.run(protector.change_now(17, "client"))
+
+
+def test_manual_change_now_supersedes_pending_delay_window(monkeypatch) -> None:
+    account = SimpleNamespace(phone_encrypted="encrypted-phone")
+    security = SimpleNamespace(login_email_encrypted=None)
+    session = AsyncMock()
+    session.__aenter__.return_value = session
+    session.get.side_effect = lambda model, key: (
+        account if model is login_email_protection.TgAccount else security
+    )
+    session.scalars.return_value = SimpleNamespace(all=lambda: [91])
+    reader = SimpleNamespace(
+        prepare_mailbox=AsyncMock(),
+        wait_for_code=AsyncMock(return_value="853353"),
+    )
+    waiter = Mock()
+    protector = LoginEmailProtector.__new__(LoginEmailProtector)
+    protector.sessionmaker = lambda: session
+    protector.reader = reader
+    protector._account_locks = {}
+    protector._change_locks = {}
+    protector._window_waiters = {91: waiter}
+    protector.manual_email_waits = {}
+    protector._gmail_slots = asyncio.Semaphore(1)
+
+    monkeypatch.setattr(
+        login_email_protection.account_ops,
+        "get_2fa_info",
+        AsyncMock(return_value={"login_email_pattern": "o***@example.com"}),
+    )
+    monkeypatch.setattr(login_email_protection.account_ops, "send_login_email_code", AsyncMock())
+    monkeypatch.setattr(
+        login_email_protection.account_ops,
+        "confirm_login_email",
+        AsyncMock(return_value=SimpleNamespace(email="1775550123_12025550147@mail.example.com")),
+    )
+    monkeypatch.setattr(login_email_protection, "decrypt_text", lambda value: "+1 202 555 0147")
+    monkeypatch.setattr(login_email_protection, "encrypt_text", lambda value: f"encrypted:{value}")
+    monkeypatch.setattr(login_email_protection.time, "time", lambda: 1775550123)
+    monkeypatch.setattr(
+        login_email_protection,
+        "get_selected_domain",
+        AsyncMock(return_value="mail.example.com"),
+    )
+
+    asyncio.run(protector.change_now(17, "client"))
+
+    session.execute.assert_awaited_once()
+    waiter.cancel.assert_called_once_with()
+    assert protector._window_waiters == {}
 
 
 def test_domain_normalization_and_validation() -> None:
@@ -238,8 +361,11 @@ def test_incomplete_protection_events_become_retryable() -> None:
     assert session.committed is True
 
 
+@pytest.mark.parametrize("premium", [False, True])
 @pytest.mark.parametrize("window_hours", [0, 24])
-def test_first_alert_uses_account_specific_window(monkeypatch, window_hours: int) -> None:
+def test_first_alert_uses_account_specific_window(
+    monkeypatch, window_hours: int, premium: bool
+) -> None:
     detected_at = datetime.now(UTC)
 
     class Session:
@@ -258,7 +384,10 @@ def test_first_alert_uses_account_specific_window(monkeypatch, window_hours: int
 
         async def get(self, model, key):
             if model is login_email_protection.ServiceMessage:
-                return SimpleNamespace(received_at=detected_at)
+                return SimpleNamespace(
+                    received_at=detected_at,
+                    text="Telegram Premium" if premium else "",
+                )
             if model is login_email_protection.TgAccount:
                 return SimpleNamespace(
                     phone_encrypted="encrypted-phone",
@@ -298,23 +427,26 @@ def test_first_alert_uses_account_specific_window(monkeypatch, window_hours: int
     assert notice is not None
     assert notice.event_id == 91
     assert notice.starts_new_window is True
-    assert notice.window_hours == window_hours
+    expected_hours = 0 if premium else window_hours
+    assert notice.window_hours == expected_hours
     assert notice.alert_count == 1
     assert session.scalar_calls == 2
     assert session.added.status == "waiting_window"
     assert session.added.alert_count == 1
     assert session.added.detected_at == detected_at
     assert session.added.window_ends_at == detected_at + login_email_protection.timedelta(
-        hours=window_hours
+        hours=expected_hours
     )
     protector._notify.assert_not_awaited()
 
 
-def test_alerts_inside_window_are_merged_without_extending_it(monkeypatch) -> None:
-    first_at = datetime.now(UTC)
+@pytest.mark.parametrize("premium", [False, True])
+def test_alerts_inside_window_are_merged_without_extending_it(monkeypatch, premium: bool) -> None:
+    first_at = datetime.now(UTC) - login_email_protection.timedelta(hours=3)
     second_at = first_at + login_email_protection.timedelta(hours=2)
     window_ends_at = first_at + login_email_protection.timedelta(hours=8)
     active_window = SimpleNamespace(
+        status="waiting_window",
         id=91,
         alert_count=1,
         detected_at=first_at,
@@ -338,7 +470,10 @@ def test_alerts_inside_window_are_merged_without_extending_it(monkeypatch) -> No
 
         async def get(self, model, key):
             if model is login_email_protection.ServiceMessage:
-                return SimpleNamespace(received_at=second_at)
+                return SimpleNamespace(
+                    received_at=second_at,
+                    text="Telegram Premium" if premium else "",
+                )
             if model is login_email_protection.TgAccount:
                 return SimpleNamespace(phone_encrypted="encrypted-phone")
             return None
@@ -358,6 +493,8 @@ def test_alerts_inside_window_are_merged_without_extending_it(monkeypatch) -> No
     protector = LoginEmailProtector.__new__(LoginEmailProtector)
     protector.sessionmaker = Sessionmaker()
     protector._notify = AsyncMock()
+    waiter = SimpleNamespace(cancel=lambda: setattr(waiter, "cancelled", True), cancelled=False)
+    protector._window_waiters = {91: waiter}
     monkeypatch.setattr(settings, "login_email_protection_enabled", True)
     monkeypatch.setattr(
         login_email_protection,
@@ -367,17 +504,21 @@ def test_alerts_inside_window_are_merged_without_extending_it(monkeypatch) -> No
 
     notice = asyncio.run(protector._record_alert_locked(4, 74))
 
+    expedited = premium
+    expected_window_end = second_at if expedited else window_ends_at
+
     assert notice is not None
     assert notice.event_id == 91
-    assert notice.starts_new_window is False
+    assert notice.starts_new_window is expedited
     assert notice.alert_count == 2
-    assert notice.window_hours == 8
-    assert notice.window_ends_at == window_ends_at
+    assert notice.window_hours == (0 if expedited else 8)
+    assert notice.window_ends_at == expected_window_end
     assert session.added.status == "merged"
     assert session.added.parent_event_id == 91
-    assert session.added.window_ends_at == window_ends_at
+    assert session.added.window_ends_at == expected_window_end
     assert active_window.alert_count == 2
     assert active_window.last_detected_at == second_at
+    assert waiter.cancelled is expedited
     protector._notify.assert_not_awaited()
 
 
@@ -408,6 +549,7 @@ def test_expired_window_immediately_runs_one_change() -> None:
     protector._window_waiters = {}
     protector._account_locks = {}
     protector._change_locks = {}
+    protector.manual_email_waits = {}
     protector._prepare_window_change = AsyncMock(
         return_value=(4, "alias@mail.example.com", "mail.example.com")
     )
@@ -430,6 +572,30 @@ def test_expired_window_immediately_runs_one_change() -> None:
         client,
     )
     assert protector._window_waiters == {}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Thank you for subscribing to Telegram Premium!",
+        "感谢订阅 Telegram Premium！",
+        "会员即将到期，详情：@premium",
+        "TELEGRAM PREMIUM",
+        "Ｔｅｌｅｇｒａｍ Ｐｒｅｍｉｕｍ",
+        "Telegram Pre\u200bmium",
+    ],
+)
+def test_premium_notices_trigger_email_protection(text: str) -> None:
+    assert is_premium_notice(text)
+    assert is_login_email_protection_alert(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "Telegram update", "@premium_support", "premiumize", "您的会员订阅即将到期"],
+)
+def test_unrelated_notices_do_not_match_premium(text: str) -> None:
+    assert not is_premium_notice(text)
 
 
 def test_protection_failure_reasons_explain_mail_delay_and_flood_wait(monkeypatch) -> None:

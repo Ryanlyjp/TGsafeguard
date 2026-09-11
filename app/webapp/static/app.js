@@ -496,6 +496,7 @@ function renderAccountDetail(account) {
       <button class="secondary-button" type="button" data-account-action="spam">检查 SpamBot</button>
       <button class="secondary-button" type="button" data-account-action="service_check">同步服务消息</button>
       <button class="secondary-button" type="button" data-account-action="export_session">导出 Session</button>
+      <button class="secondary-button" type="button" data-account-action="rotate_login_email">一键换绑邮箱</button>
     </div>
     <div class="detail-sections">
       <details class="detail-section" open><summary>资料与头像</summary><div class="detail-section-body">

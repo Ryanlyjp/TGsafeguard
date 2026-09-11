@@ -123,6 +123,20 @@ def test_account_deletion_uses_two_confirmations_and_preserves_page() -> None:
     assert second.inline_keyboard[1][0].callback_data == "acct:17:3"
 
 
+def test_account_places_one_click_login_email_rotation_left_of_session_export() -> None:
+    rows = account_actions_panel(17).inline_keyboard
+    action_row = next(
+        row
+        for row in rows
+        if any(button.callback_data == "acct_action:rotate_login_email:17" for button in row)
+    )
+
+    assert [(button.text, button.callback_data) for button in action_row] == [
+        ("一键换绑邮箱", "acct_action:rotate_login_email:17"),
+        ("导出 Session", "acct_action:export_session:17"),
+    ]
+
+
 def test_advanced_features_stay_out_of_reply_keyboard() -> None:
     labels = {button.text for row in main_menu().keyboard for button in row}
     assert labels.isdisjoint(

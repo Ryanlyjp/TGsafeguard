@@ -7,6 +7,7 @@ import logging
 import re
 import threading
 import time
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -164,6 +165,20 @@ def is_login_code_alert(text: str) -> bool:
         LOGIN_CODE_VALUE_PATTERN.search(value)
         and any(pattern.search(value) for pattern in LOGIN_CODE_ALERT_PATTERNS)
     )
+
+
+PREMIUM_NOTICE_PATTERN = re.compile(r"(?<!\w)premium(?!\w)", re.IGNORECASE)
+
+
+def is_premium_notice(text: str) -> bool:
+    """Recognize the shared Premium marker in trusted 777000 service notices."""
+    value = unicodedata.normalize("NFKC", text or "")
+    value = "".join(char for char in value if unicodedata.category(char) != "Cf")
+    return bool(PREMIUM_NOTICE_PATTERN.search(value))
+
+
+def is_login_email_protection_alert(text: str) -> bool:
+    return is_login_code_alert(text) or is_premium_notice(text)
 
 
 async def recover_incomplete_events(
@@ -955,6 +970,7 @@ class LoginEmailProtector:
         self._account_locks: dict[int, asyncio.Lock] = {}
         self._change_locks: dict[int, asyncio.Lock] = {}
         self._window_waiters: dict[int, asyncio.Task[None]] = {}
+        self.manual_email_waits: dict[int, datetime] = {}
         self._gmail_slots = asyncio.Semaphore(3)
 
     def has_window_waiter(self, event_id: int) -> bool:
@@ -963,7 +979,13 @@ class LoginEmailProtector:
 
     def has_change_in_progress(self, account_id: int) -> bool:
         lock = self._change_locks.get(account_id)
-        return lock is not None and lock.locked()
+        return (lock is not None and lock.locked()) or self.manual_email_wait_remaining(account_id) > 0
+
+    def manual_email_wait_remaining(self, account_id: int) -> float:
+        deadline = getattr(self, "manual_email_waits", {}).get(account_id)
+        if deadline is None:
+            return 0
+        return max(0, (deadline - datetime.now(UTC)).total_seconds())
 
     async def cancel_account_tasks(self, account_id: int, event_ids: set[int]) -> None:
         """Cancel protection waiters and forget per-account synchronization state."""
@@ -980,6 +1002,83 @@ class LoginEmailProtector:
             self._window_waiters.pop(event_id, None)
         self._account_locks.pop(account_id, None)
         self._change_locks.pop(account_id, None)
+
+    async def change_now(self, account_id: int, client: TelegramClient) -> str:
+        """Immediately rotate an existing login email without a 777000 event."""
+        if self.has_change_in_progress(account_id):
+            raise ValueError("该账号正在换绑或等待验证码，请稍后再试")
+        change_lock = self._change_locks.setdefault(account_id, asyncio.Lock())
+        async with change_lock:
+            info = await account_ops.get_2fa_info(client)
+            if not info.get("login_email_pattern"):
+                raise ValueError(
+                    "该账号尚未设置登录邮箱，不能执行换绑；"
+                    "首次设置必须在 Telegram 登录流程要求配置邮箱时完成"
+                )
+
+            account_lock = self._account_locks.setdefault(account_id, asyncio.Lock())
+            async with account_lock:
+                async with self.sessionmaker() as session:
+                    account = await session.get(TgAccount, account_id)
+                    if account is None:
+                        raise ValueError("账号不存在")
+                    domain = await get_selected_domain(session)
+                    if domain is None:
+                        raise ValueError("未配置登录邮箱域名")
+                    target_email = build_alias(decrypt_text(account.phone_encrypted), domain)
+                    pending_window_ids = set(
+                        (
+                            await session.scalars(
+                                select(LoginEmailProtectionEvent.id).where(
+                                    LoginEmailProtectionEvent.account_id == account_id,
+                                    LoginEmailProtectionEvent.parent_event_id.is_(None),
+                                    LoginEmailProtectionEvent.status == "waiting_window",
+                                )
+                            )
+                        ).all()
+                    )
+
+            try:
+                prepare_mailbox = getattr(self.reader, "prepare_mailbox", None)
+                if prepare_mailbox is not None:
+                    await prepare_mailbox(target_email)
+                requested_at = datetime.now(UTC)
+                await account_ops.send_login_email_code(client, target_email)
+                async with self._gmail_slots:
+                    code = await self.reader.wait_for_code(target_email, requested_at)
+                result = await account_ops.confirm_login_email(client, code)
+                confirmed_email = str(getattr(result, "email", "") or "")
+                if confirmed_email and confirmed_email.lower() != target_email.lower():
+                    raise RuntimeError("Telegram 返回的确认邮箱与目标邮箱不一致")
+
+                async with self.sessionmaker() as session:
+                    security = await session.get(AccountSecurity, account_id)
+                    if security is None:
+                        security = AccountSecurity(account_id=account_id, has_2fa=False)
+                        session.add(security)
+                    security.login_email_encrypted = encrypt_text(target_email)
+                    if pending_window_ids:
+                        await session.execute(
+                            update(LoginEmailProtectionEvent)
+                            .where(
+                                LoginEmailProtectionEvent.id.in_(pending_window_ids),
+                                LoginEmailProtectionEvent.status == "waiting_window",
+                            )
+                            .values(
+                                status="superseded",
+                                error="管理员已手动立即换绑登录邮箱",
+                            )
+                        )
+                    await session.commit()
+                for event_id in pending_window_ids:
+                    waiter = self._window_waiters.pop(event_id, None)
+                    if waiter is not None and waiter is not asyncio.current_task():
+                        waiter.cancel()
+                return target_email
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise ValueError(self._friendly_failure_reason(exc)) from exc
 
     async def _notify(
         self,
@@ -1037,7 +1136,7 @@ class LoginEmailProtector:
         text: str,
         client: TelegramClient,
     ) -> None:
-        if not is_login_code_alert(text):
+        if not is_login_email_protection_alert(text):
             return
         notice = await self.record_alert(account_id, service_message_id)
         if notice is not None and notice.starts_new_window:
@@ -1068,6 +1167,7 @@ class LoginEmailProtector:
             service_message = await session.get(ServiceMessage, service_message_id)
             if service_message is None:
                 return None
+            immediate = is_premium_notice(service_message.text or "")
             alert_at = service_message.received_at
             if alert_at.tzinfo is None:
                 alert_at = alert_at.replace(tzinfo=UTC)
@@ -1090,7 +1190,7 @@ class LoginEmailProtector:
                 session.add(event)
                 await session.commit()
                 await self._notify(
-                    f"登录邮箱保护\n账号 #{account_id} 在白名单中：仅转发 777000 登录提醒，未更改登录邮箱。"
+                    f"登录邮箱保护\n账号 #{account_id} 在白名单中：仅转发 777000 保护提醒，未更改登录邮箱。"
                 )
                 return None
             if not settings.login_email_protection_enabled:
@@ -1098,7 +1198,7 @@ class LoginEmailProtector:
                 session.add(event)
                 await session.commit()
                 await self._notify(
-                    f"登录邮箱保护\n账号 #{account_id} 检测到登录提醒，但自动换绑尚未启用。"
+                    f"登录邮箱保护\n账号 #{account_id} 检测到保护提醒，但自动换绑尚未启用。"
                 )
                 return None
             active_window = await session.scalar(
@@ -1119,6 +1219,9 @@ class LoginEmailProtector:
                 .limit(1)
             )
             if active_window is not None:
+                expedited = immediate and active_window.status == "waiting_window"
+                if expedited:
+                    active_window.window_ends_at = min(alert_at, datetime.now(UTC))
                 event.status = "merged"
                 event.parent_event_id = active_window.id
                 event.window_ends_at = active_window.window_ends_at
@@ -1130,10 +1233,14 @@ class LoginEmailProtector:
                 ):
                     active_window.last_detected_at = alert_at
                 await session.commit()
+                if expedited:
+                    waiter = self._window_waiters.pop(active_window.id, None)
+                    if waiter is not None and waiter is not asyncio.current_task():
+                        waiter.cancel()
                 return LoginEmailWindowNotice(
                     event_id=active_window.id,
                     window_ends_at=active_window.window_ends_at,
-                    window_hours=max(
+                    window_hours=0 if expedited else max(
                         0,
                         round(
                             (
@@ -1143,10 +1250,10 @@ class LoginEmailProtector:
                         ),
                     ),
                     alert_count=active_window.alert_count,
-                    starts_new_window=False,
+                    starts_new_window=expedited,
                 )
 
-            window_hours = max(
+            window_hours = 0 if immediate else max(
                 0,
                 min(int(getattr(account, "login_email_window_hours", 0) or 0), 720),
             )
@@ -1194,8 +1301,14 @@ class LoginEmailProtector:
                     await asyncio.sleep(delay)
                     continue
 
+                manual_wait = self.manual_email_wait_remaining(account_id)
+                if manual_wait > 0:
+                    await asyncio.sleep(min(manual_wait, 1))
+                    continue
                 change_lock = self._change_locks.setdefault(account_id, asyncio.Lock())
                 async with change_lock:
+                    if self.manual_email_wait_remaining(account_id) > 0:
+                        continue
                     lock = self._account_locks.setdefault(account_id, asyncio.Lock())
                     async with lock:
                         prepared = await self._prepare_window_change(event_id)
@@ -1232,6 +1345,14 @@ class LoginEmailProtector:
                 event.error = "账号不存在"
                 await session.commit()
                 return None
+            if await session.get(LoginEmailWhitelist, event.account_id) is not None:
+                event.status = "whitelisted"
+                await session.commit()
+                return None
+            if not settings.login_email_protection_enabled:
+                event.status = "disabled"
+                await session.commit()
+                return None
             domain = await get_selected_domain(session)
             if domain is None:
                 event.status = "failed"
@@ -1253,7 +1374,7 @@ class LoginEmailProtector:
         async with self.sessionmaker() as session:
             event = await session.get(LoginEmailProtectionEvent, event_id)
             if event is None:
-                return "窗口内登录提醒：未知"
+                return "窗口内保护提醒：未知"
             first_at = event.detected_at.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
             last_at = (
                 (event.last_detected_at or event.detected_at)
@@ -1267,9 +1388,9 @@ class LoginEmailProtector:
                     int((event.window_ends_at - event.detected_at).total_seconds()),
                 )
             window_label = (
-                "即时保护触发的登录提醒"
+                "即时保护触发的保护提醒"
                 if duration_seconds == 0
-                else f"{duration_seconds // 3600} 小时窗口内登录提醒"
+                else f"{duration_seconds // 3600} 小时窗口内保护提醒"
             )
             return f"{window_label}：{event.alert_count} 次\n首次：{first_at}\n最后：{last_at}"
 
@@ -1288,7 +1409,7 @@ class LoginEmailProtector:
                 raise ValueError("保护事件不存在")
             account_id = event.account_id
         change_lock = self._change_locks.setdefault(account_id, asyncio.Lock())
-        if change_lock.locked():
+        if self.has_change_in_progress(account_id):
             raise ValueError("该账号正在等待换绑邮件，请勿重复请求验证码")
         async with change_lock:
             lock = self._account_locks.setdefault(account_id, asyncio.Lock())
