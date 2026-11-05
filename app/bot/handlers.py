@@ -37,6 +37,7 @@ from telethon.errors import (
 
 from app.bot.auth import AdminOnlyMiddleware
 from app.bot.formatting import COMMANDS, account_line
+from app.bot.interaction_cleanup import finish_message_flow
 from app.bot.keyboards import (
     account_actions_panel,
     account_delete_confirm_panel,
@@ -157,6 +158,7 @@ BOT_COMMANDS = [
     BotCommand(command="help", description="查看使用帮助"),
     BotCommand(command="status", description="查看系统状态"),
     BotCommand(command="accounts", description="管理 Telegram 账号"),
+    BotCommand(command="messages", description="发送消息与管理自动发送"),
     BotCommand(command="login", description="登录并添加账号"),
     BotCommand(command="qr_login", description="扫码登录并添加账号"),
     BotCommand(command="app", description="打开内置管理应用"),
@@ -757,7 +759,7 @@ async def cancel_current(message: Message, state: FSMContext) -> None:
             await client.disconnect()
         except Exception:
             pass
-    await state.clear()
+    await finish_message_flow(state, message.bot, message.chat.id, message)
     await message.answer("已取消当前操作，主菜单仍可从输入框旁展开。", reply_markup=main_menu())
 
 
@@ -770,7 +772,15 @@ async def cancel_current_callback(callback: CallbackQuery, state: FSMContext) ->
             await client.disconnect()
         except Exception:
             pass
-    await state.clear()
+    if callback.message:
+        await finish_message_flow(
+            state,
+            callback.bot,
+            callback.message.chat.id,
+            callback.message,
+        )
+    else:
+        await state.clear()
     await callback.answer("已取消")
     if callback.message:
         await callback.message.answer("已取消当前操作，主菜单仍可从输入框旁展开。", reply_markup=main_menu())

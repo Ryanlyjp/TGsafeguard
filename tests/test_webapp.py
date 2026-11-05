@@ -20,6 +20,7 @@ from app.services.pagination import require_account_capacity
 from app.webapp.server import (
     account_pagination,
     api_account_action,
+    api_scheduled_messages,
     create_webhook_app,
     create_webapp,
     qr_login_payload,
@@ -112,6 +113,68 @@ def test_mini_app_registers_account_delete_route() -> None:
     ]
 
     assert len(delete_routes) == 1
+
+
+def test_mini_app_registers_message_and_schedule_routes() -> None:
+    app = asyncio.run(create_webapp(None, None))
+    routes = {(route.method, route.resource.canonical) for route in app.router.routes()}
+
+    assert ("GET", "/mini-app/api/message-accounts") in routes
+    assert ("POST", "/mini-app/api/messages/send") in routes
+    assert ("GET", "/mini-app/api/scheduled-messages") in routes
+    assert ("POST", "/mini-app/api/scheduled-messages") in routes
+
+
+def test_mini_app_bulk_schedule_creation_preserves_selected_accounts(monkeypatch) -> None:
+    admin = SimpleNamespace(id=3)
+    session = SimpleNamespace(scalar=AsyncMock(return_value=admin), commit=AsyncMock())
+
+    class SessionContext:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    request = SimpleNamespace(
+        method="POST",
+        app={"sessionmaker": lambda: SessionContext()},
+        json=AsyncMock(
+            return_value={
+                "action": "create",
+                "account_ids": [7, 8],
+                "target": "@example_bot",
+                "text": "/checkin",
+                "base_time": "12:05",
+                "random_offset_minutes": 60,
+            }
+        ),
+    )
+    create_mock = AsyncMock(
+        return_value=[
+            SimpleNamespace(id=21, rule_id=11),
+            SimpleNamespace(id=22, rule_id=11),
+        ]
+    )
+    monkeypatch.setattr(
+        "app.webapp.server.authenticated",
+        AsyncMock(return_value=SimpleNamespace(id=99)),
+    )
+    monkeypatch.setattr("app.webapp.server.create_schedules", create_mock)
+    monkeypatch.setattr("app.webapp.server.audit", AsyncMock())
+
+    response = asyncio.run(api_scheduled_messages(request))
+
+    assert response.status == 200
+    assert json.loads(response.text)["message"] == "已为 2 个账号创建自动发送规则"
+    assert create_mock.await_args.args[1:] == (
+        [7, 8],
+        "@example_bot",
+        "/checkin",
+        12,
+        5,
+        60,
+    )
 
 
 def test_mini_app_account_action_runs_one_click_login_email_rotation(monkeypatch) -> None:
@@ -289,7 +352,7 @@ def test_mini_app_actions_enable_compact_view_specific_layout() -> None:
     styles = Path("app/webapp/static/styles.css").read_text(encoding="utf-8")
 
     assert '<body data-view="dashboard">' in index
-    assert "20260813-delete1" in index
+    assert "20261102-daily-summary1" in index
     assert "document.body.dataset.view = view" in script
     assert "tg.disableVerticalSwipes?.()" in script
     assert 'height: var(--tg-viewport-stable-height, 100dvh)' in styles
@@ -306,3 +369,14 @@ def test_mini_app_actions_enable_compact_view_specific_layout() -> None:
     assert 'method: "DELETE"' in script
     assert script.count("await confirmAction(`") >= 2
     assert ".account-danger-zone" in styles
+    assert 'id="messageAccountPicker"' in index
+    assert 'id="scheduleAccountPicker"' in index
+    assert 'id="selectAllMessageAccounts"' in index
+    assert 'id="clearMessageAccounts"' in index
+    assert 'id="selectAllScheduleAccounts"' in index
+    assert 'id="clearScheduleAccounts"' in index
+    assert 'function setAccountSelection(kind, selectAll)' in script
+    assert 'id="scheduleHistory"' in index
+    assert 'data-history-reuse' in script
+    assert 'data-schedule-action="reuse"' in script
+    assert 'timeZone: "Asia/Singapore"' in script

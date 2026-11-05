@@ -168,6 +168,16 @@ details.detail-section[open] > summary::after { content: "−"; }
 .form { display: grid; gap: 12px; }
 .form label { display: grid; gap: 7px; min-width: 0; }
 .form label > span { color: var(--muted); font-size: 11px; font-weight: 680; }
+.field-label { display: block; margin-bottom: 7px; color: var(--muted); font-size: 11px; font-weight: 680; }
+.account-picker { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; max-height: 220px; overflow-y: auto; padding: 8px; border: 1px solid var(--line); border-radius: 12px; }
+.account-picker-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+.account-picker-actions { display: flex; align-items: center; gap: 4px; }
+.account-picker-actions .link-button { min-height: 30px; padding: 4px 8px; }
+.account-picker .account-choice { display: flex; grid-template-columns: none; align-items: center; gap: 8px; min-width: 0; padding: 8px; border-radius: 9px; background: color-mix(in srgb, var(--bg) 55%, var(--surface)); cursor: pointer; }
+.account-picker .account-choice input { flex: none; width: 18px; height: 18px; margin: 0; }
+.account-picker .account-choice span { min-width: 0; overflow-wrap: anywhere; color: var(--text); font-size: 12px; }
+.schedule-row-actions { margin-top: 8px; }
+.danger-text { color: var(--danger); }
 input, textarea, select { width: 100%; border: 1px solid var(--line); border-radius: 12px; padding: 11px 12px; color: var(--text); background: color-mix(in srgb, var(--bg) 55%, var(--surface)); }
 textarea { resize: vertical; line-height: 1.55; }
 input::placeholder, textarea::placeholder { color: color-mix(in srgb, var(--muted) 72%, transparent); }
@@ -271,6 +281,7 @@ button:disabled { opacity: .55; cursor: wait; }
   .quick-card span strong { font-size: 13px; }
   .quick-card span small { margin-top: 2px; font-size: 10px; }
   .split { grid-template-columns: 1fr; }
+  .account-picker { grid-template-columns: 1fr; }
   input, textarea, select { font-size: 16px; }
   details.detail-section > summary { min-height: 48px; padding: 12px 14px; }
   .detail-section-body { padding: 14px; }

@@ -12,6 +12,13 @@ def test_initial_migration_matches_incremental_history() -> None:
     )
     eighth = Path("alembic/versions/0008_account_login_email_window.py").read_text(encoding="utf-8")
     ninth = Path("alembic/versions/0009_temp_mail_messages.py").read_text(encoding="utf-8")
+    tenth = Path("alembic/versions/0010_scheduled_messages.py").read_text(encoding="utf-8")
+    eleventh = Path("alembic/versions/0011_scheduled_rule_groups.py").read_text(
+        encoding="utf-8"
+    )
+    twelfth = Path("alembic/versions/0012_scheduled_daily_reports.py").read_text(
+        encoding="utf-8"
+    )
     assert 'sa.Column("text", sa.Text()' not in initial
     assert "uq_service_account_message" in initial
     assert 'op.add_column("service_messages"' in second
@@ -29,3 +36,15 @@ def test_initial_migration_matches_incremental_history() -> None:
     assert '"temp_mail_messages"' in ninth
     assert 'sa.PrimaryKeyConstraint("id", "to"' in ninth
     assert '"received_at"' in ninth
+    assert '"scheduled_messages"' in tenth
+    assert '"next_run_at"' in tenth
+    assert "random_offset_minutes >= 0 AND random_offset_minutes <= 720" in tenth
+    assert 'down_revision = "0010_scheduled_messages"' in eleventh
+    assert '"scheduled_message_rules"' in eleventh
+    assert '"rule_id"' in eleventh
+    assert "UPDATE scheduled_messages" in eleventh
+    assert "uq_scheduled_messages_rule_account" in eleventh
+    assert 'down_revision = "0011_scheduled_rule_groups"' in twelfth
+    assert '"scheduled_message_daily_runs"' in twelfth
+    assert "uq_scheduled_message_daily_run_rule_date" in twelfth
+    assert "completed_count = succeeded_count + failed_count + skipped_count" in twelfth

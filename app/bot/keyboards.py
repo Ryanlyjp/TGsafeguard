@@ -20,11 +20,11 @@ def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="系统状态"), KeyboardButton(text="账号管理")],
+            [KeyboardButton(text="发送消息"), KeyboardButton(text="安全防护")],
             [
                 KeyboardButton(text="登录账号"),
                 KeyboardButton(text="扫码登录"),
             ],
-            [KeyboardButton(text="安全防护")],
         ],
         resize_keyboard=True,
         is_persistent=False,
@@ -86,7 +86,12 @@ def account_button_label(account: TgAccount) -> str:
         identity = f"@{account.username}"
     else:
         identity = account.phone_masked
-    return f"#{account.id} · {identity}"
+    name = " ".join(
+        part
+        for part in [getattr(account, "first_name", None), getattr(account, "last_name", None)]
+        if part
+    )
+    return f"#{account.id} · {identity}" + (f" · {name}" if name else "")
 
 
 def accounts_panel(
@@ -188,6 +193,14 @@ def account_actions_panel(account_id: int, accounts_page: int = 1) -> InlineKeyb
                 ),
                 InlineKeyboardButton(
                     text="导出 Session", callback_data=f"acct_action:export_session:{account_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="发送消息", callback_data=f"msgsend:start:{account_id}"
+                ),
+                InlineKeyboardButton(
+                    text="设置自动发送", callback_data=f"msgsched:list:{account_id}"
                 ),
             ],
             [

@@ -26,6 +26,7 @@ COMMANDS = """可用指令
 /status - 系统状态
 /security - 登录邮箱保护、域名和白名单管理
 /accounts - 账号列表
+/messages - 发送消息与管理每日自动发送规则
 /account <id> - 账号详情
 /account_info <id> - 账号详细信息与 SpamBot 状态
 /login - 手动登录/注册账号

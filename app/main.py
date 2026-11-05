@@ -7,11 +7,13 @@ from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramAPIError
 
 from app.bot.handlers import configure_bot_ui, router
+from app.bot.message_handlers import router as message_router
 from app.bot.keyboards import main_menu
 from app.config import settings
 from app.db.session import init_db, sessionmaker
 from app.services.bootstrap import bootstrap_defaults
 from app.services.login_email_protection import recover_incomplete_events
+from app.services.scheduled_messages import ScheduledMessageService
 from app.tg.client_pool import ClientPool
 from app.webapp.server import start_webapp
 
@@ -56,7 +58,9 @@ async def main() -> None:
     except TelegramAPIError:
         logger.warning("Failed to configure Telegram command menu", exc_info=True)
     pool = ClientPool(sessionmaker=sessionmaker, bot=bot)
+    scheduled_messages = ScheduledMessageService(sessionmaker, pool)
     dp = Dispatcher(sessionmaker=sessionmaker, client_pool=pool)
+    dp.include_router(message_router)
     dp.include_router(router)
 
     web_runner = await start_webapp(sessionmaker, pool)
@@ -64,12 +68,14 @@ async def main() -> None:
         logger.info("Mini App server started on %s:%s", settings.mini_app_host, settings.mini_app_port)
 
     await pool.start_service_monitor()
+    await scheduled_messages.start()
     await restore_admin_keyboards(bot)
     try:
         await dp.start_polling(bot)
     finally:
         if web_runner is not None:
             await web_runner.cleanup()
+        await scheduled_messages.stop()
         await pool.stop_service_monitor()
         await bot.session.close()
 

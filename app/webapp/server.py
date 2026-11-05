@@ -42,6 +42,7 @@ from app.db.models import (
     LoginEmailProtectionEvent,
     PrivacySettings,
     RateLimit,
+    ScheduledMessage,
     ServiceMessage,
     SpamCheck,
     TgAccount,
@@ -63,6 +64,12 @@ from app.services.pagination import ACCOUNT_PAGE_SIZE, account_page_window
 from app.services.qr_code import login_qr_png
 from app.services.rate_limit import RateGate, get_rate, validate_rate_values
 from app.services.security_health import SecurityHealthReport, run_security_health_check
+from app.services.scheduled_messages import (
+    SINGAPORE_TZ,
+    create_schedules,
+    run_message_job,
+    update_schedule,
+)
 from app.services.targets import canonicalize_target_ref, require_allowed_target
 from app.services.temp_mail import (
     notify_temp_mail_recipient,
@@ -550,8 +557,29 @@ async def api_jobs(request: web.Request) -> web.Response:
         limit = min(max(int(request.query.get("limit", "8")), 1), 30)
     except ValueError as exc:
         raise web.HTTPBadRequest(text="limit must be an integer") from exc
+    account_id_raw = request.query.get("account_id")
+    message_only = request.query.get("message_only") == "1"
     async with sessionmaker() as session:
-        jobs = list((await session.scalars(select(Job).order_by(Job.id.desc()).limit(limit))).all())
+        query = select(Job)
+        if account_id_raw:
+            try:
+                account_id = int(account_id_raw)
+            except ValueError as exc:
+                raise web.HTTPBadRequest(text="account_id must be an integer") from exc
+            query = query.join(JobItem).where(JobItem.account_id == account_id).distinct()
+        if message_only:
+            query = query.where(
+                Job.type.in_(
+                    {
+                        "send",
+                        "send_all",
+                        "webapp_send",
+                        "manual_send",
+                        "scheduled_send",
+                    }
+                )
+            )
+        jobs = list((await session.scalars(query.order_by(Job.id.desc()).limit(limit))).all())
         payload = []
         for job in jobs:
             counts = dict(
@@ -571,10 +599,169 @@ async def api_jobs(request: web.Request) -> web.Response:
                     "started_at": job.started_at.isoformat() if job.started_at else None,
                     "finished_at": job.finished_at.isoformat() if job.finished_at else None,
                     "error": job.error,
+                    "params": job.params_json or {},
                     "items": counts,
                 }
             )
     return web.json_response({"jobs": payload})
+
+
+def scheduled_message_payload(rule: ScheduledMessage) -> dict[str, Any]:
+    return {
+        "id": rule.id,
+        "rule_id": rule.rule_id,
+        "account_id": rule.account_id,
+        "target": rule.target_ref,
+        "text": rule.message_text,
+        "base_time": f"{rule.base_minute // 60:02d}:{rule.base_minute % 60:02d}",
+        "random_offset_minutes": rule.random_offset_minutes,
+        "timezone": rule.timezone,
+        "enabled": rule.enabled,
+        "next_run_at": rule.next_run_at.isoformat(),
+        "next_run_singapore": rule.next_run_at.astimezone(SINGAPORE_TZ).isoformat(),
+    }
+
+
+async def api_message_accounts(request: web.Request) -> web.Response:
+    await authenticated(request)
+    sessionmaker = request.app["sessionmaker"]
+    async with sessionmaker() as session:
+        accounts = list(
+            (
+                await session.scalars(
+                    select(TgAccount)
+                    .join(TgSession, TgSession.account_id == TgAccount.id)
+                    .where(TgSession.is_active.is_(True))
+                    .order_by(TgAccount.id)
+                )
+            ).all()
+        )
+    return web.json_response({"accounts": [account_payload(account) for account in accounts]})
+
+
+async def api_message_send(request: web.Request) -> web.Response:
+    user = await authenticated(request)
+    data = await request.json()
+    account_ids = [int(value) for value in data.get("account_ids", [])]
+    result = await run_message_job(
+        request.app["sessionmaker"],
+        request.app["client_pool"],
+        account_ids,
+        str(data.get("target") or ""),
+        str(data.get("text") or ""),
+        job_type="manual_send",
+        admin_telegram_user_id=user.id,
+    )
+    return web.json_response(
+        {
+            "ok": result.failed == 0,
+            "job_id": result.job_id,
+            "succeeded": result.succeeded,
+            "failed": result.failed,
+            "message": f"发送完成：成功 {result.succeeded}，失败 {result.failed}",
+        }
+    )
+
+
+async def api_scheduled_messages(request: web.Request) -> web.Response:
+    user = await authenticated(request)
+    sessionmaker = request.app["sessionmaker"]
+    if request.method == "GET":
+        query = select(ScheduledMessage).order_by(
+            ScheduledMessage.rule_id,
+            ScheduledMessage.account_id,
+            ScheduledMessage.id,
+        )
+        account_id_raw = request.query.get("account_id")
+        if account_id_raw:
+            try:
+                account_id = int(account_id_raw)
+            except ValueError as exc:
+                raise web.HTTPBadRequest(text="account_id must be an integer") from exc
+            query = query.where(ScheduledMessage.account_id == account_id)
+        async with sessionmaker() as session:
+            rules = list((await session.scalars(query)).all())
+        return web.json_response(
+            {"schedules": [scheduled_message_payload(rule) for rule in rules]}
+        )
+
+    data = await request.json()
+    action = str(data.get("action") or "create")
+    async with sessionmaker() as session:
+        admin = await session.scalar(select(Admin).where(Admin.telegram_user_id == user.id))
+        if action == "create":
+            account_ids = [int(value) for value in data.get("account_ids", [])]
+            base_time = str(data.get("base_time") or "")
+            try:
+                hour, minute = (int(value) for value in base_time.split(":", 1))
+            except (TypeError, ValueError) as exc:
+                raise web.HTTPBadRequest(text="时间格式必须是 HH:MM") from exc
+            rules = await create_schedules(
+                session,
+                account_ids,
+                str(data.get("target") or ""),
+                str(data.get("text") or ""),
+                hour,
+                minute,
+                int(data.get("random_offset_minutes", 0)),
+            )
+            await audit(
+                session,
+                admin,
+                "scheduled_message_create",
+                "scheduled_message_rule",
+                str(rules[0].rule_id),
+                {"account_ids": account_ids, "count": len(rules)},
+            )
+            message = f"已为 {len(rules)} 个账号创建自动发送规则"
+        else:
+            rule_id = int(data.get("schedule_id", 0))
+            rule = await session.get(ScheduledMessage, rule_id)
+            if rule is None:
+                raise web.HTTPNotFound(text="自动发送规则不存在")
+            if action == "update":
+                base_time = str(data.get("base_time") or "")
+                try:
+                    hour, minute = (int(value) for value in base_time.split(":", 1))
+                except (TypeError, ValueError) as exc:
+                    raise web.HTTPBadRequest(text="时间格式必须是 HH:MM") from exc
+                await update_schedule(
+                    rule,
+                    str(data.get("target") or ""),
+                    str(data.get("text") or ""),
+                    hour,
+                    minute,
+                    int(data.get("random_offset_minutes", 0)),
+                    session,
+                )
+                message = "自动发送规则已更新，将从明天生效"
+            elif action == "toggle":
+                rule.enabled = bool(data.get("enabled"))
+                if rule.enabled:
+                    await update_schedule(
+                        rule,
+                        rule.target_ref,
+                        rule.message_text,
+                        rule.base_minute // 60,
+                        rule.base_minute % 60,
+                        rule.random_offset_minutes,
+                        session,
+                    )
+                message = "自动发送规则已启用" if rule.enabled else "自动发送规则已停用"
+            elif action == "delete":
+                await session.delete(rule)
+                message = "自动发送规则已删除"
+            else:
+                raise web.HTTPBadRequest(text="unsupported schedule action")
+            await audit(
+                session,
+                admin,
+                f"scheduled_message_{action}",
+                "scheduled_message",
+                str(rule_id),
+            )
+        await session.commit()
+    return web.json_response({"ok": True, "message": message})
 
 
 def account_pagination(total: int, requested_page: int) -> tuple[int, int, int]:
@@ -1851,6 +2038,10 @@ async def create_webapp(
     app.router.add_get("/mini-app/api/security-health", api_security_health)
     app.router.add_post("/mini-app/api/monitor", api_monitor_update)
     app.router.add_get("/mini-app/api/jobs", api_jobs)
+    app.router.add_get("/mini-app/api/message-accounts", api_message_accounts)
+    app.router.add_post("/mini-app/api/messages/send", api_message_send)
+    app.router.add_get("/mini-app/api/scheduled-messages", api_scheduled_messages)
+    app.router.add_post("/mini-app/api/scheduled-messages", api_scheduled_messages)
     app.router.add_get("/mini-app/api/accounts", api_accounts)
     app.router.add_post("/mini-app/api/accounts/login/start", api_login_start)
     app.router.add_post("/mini-app/api/accounts/login/verify", api_login_verify)

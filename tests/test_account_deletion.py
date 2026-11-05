@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import create_engine, func, select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import TextClause
 
@@ -19,6 +20,8 @@ from app.db.models import (
     LoginEmailProtectionEvent,
     LoginEmailWhitelist,
     PrivacySettings,
+    ScheduledMessage,
+    ScheduledMessageRule,
     ServiceMessage,
     SpamCheck,
     TgAccount,
@@ -26,6 +29,7 @@ from app.db.models import (
 )
 from app.services.account_deletion import (
     _without_account_reference,
+    account_jobs_statement,
     delete_account_records,
 )
 from app.tg.client_pool import ClientPool
@@ -48,6 +52,26 @@ def _seed_account_graph(session: Session, account_id: int, job_id: int) -> None:
     session.add(PrivacySettings(account_id=account_id, rules_json={"phone": "nobody"}))
     session.add(SpamCheck(account_id=account_id, status_detected="ok"))
     session.add(LoginEmailWhitelist(account_id=account_id))
+    session.add(
+        ScheduledMessageRule(
+            id=account_id,
+            target_ref="@example_bot",
+            message_text="/checkin",
+            base_minute=720,
+            random_offset_minutes=60,
+        )
+    )
+    session.add(
+        ScheduledMessage(
+            rule_id=account_id,
+            account_id=account_id,
+            target_ref="@example_bot",
+            message_text="/checkin",
+            base_minute=720,
+            random_offset_minutes=60,
+            next_run_at=datetime.now(UTC),
+        )
+    )
     service_message = ServiceMessage(
         account_id=account_id,
         source_user_id=777000,
@@ -87,6 +111,7 @@ def test_account_deletion_removes_only_the_selected_account_graph() -> None:
         PrivacySettings,
         SpamCheck,
         LoginEmailWhitelist,
+        ScheduledMessage,
         ServiceMessage,
         LoginEmailProtectionEvent,
         JobItem,
@@ -160,6 +185,18 @@ def test_reference_scrubber_does_not_touch_other_accounts() -> None:
         "nested": {"account_id": 22, "account_ids": [22]},
         "unrelated_number": 11,
     }
+
+
+def test_account_job_lookup_does_not_compare_postgresql_json() -> None:
+    statement = str(
+        account_jobs_statement(11).compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert "DISTINCT" not in statement
+    assert "jobs.id IN (SELECT job_items.job_id" in " ".join(statement.split())
 
 
 def test_deletion_fence_cancels_only_target_account_tasks_and_connection() -> None:

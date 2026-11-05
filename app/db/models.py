@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Optional
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -173,6 +174,129 @@ class JobItem(Base):
     status: Mapped[str] = mapped_column(String(32), default="pending")
     result_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
     error: Mapped[Optional[str]] = mapped_column(Text)
+
+
+class ScheduledMessageRule(Base):
+    __tablename__ = "scheduled_message_rules"
+    __table_args__ = (
+        CheckConstraint(
+            "base_minute >= 0 AND base_minute <= 1439",
+            name="ck_scheduled_message_rules_base_minute",
+        ),
+        CheckConstraint(
+            "random_offset_minutes >= 0 AND random_offset_minutes <= 720",
+            name="ck_scheduled_message_rules_random_offset",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    target_ref: Mapped[str] = mapped_column(String(256))
+    message_text: Mapped[str] = mapped_column(Text)
+    base_minute: Mapped[int] = mapped_column(Integer)
+    random_offset_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Singapore")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    assignments: Mapped[list[ScheduledMessage]] = relationship(
+        back_populates="rule",
+        cascade="all, delete-orphan",
+    )
+    daily_runs: Mapped[list[ScheduledMessageDailyRun]] = relationship(
+        back_populates="rule",
+        cascade="all, delete-orphan",
+    )
+
+
+class ScheduledMessageDailyRun(Base):
+    __tablename__ = "scheduled_message_daily_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "rule_id",
+            "run_date",
+            name="uq_scheduled_message_daily_run_rule_date",
+        ),
+        CheckConstraint(
+            "claimed_count >= 0 AND completed_count >= 0 "
+            "AND succeeded_count >= 0 AND failed_count >= 0 AND skipped_count >= 0",
+            name="ck_scheduled_message_daily_runs_nonnegative",
+        ),
+        CheckConstraint(
+            "completed_count = succeeded_count + failed_count + skipped_count",
+            name="ck_scheduled_message_daily_runs_completed_total",
+        ),
+        CheckConstraint(
+            "completed_count <= claimed_count",
+            name="ck_scheduled_message_daily_runs_claimed_total",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rule_id: Mapped[int] = mapped_column(
+        ForeignKey("scheduled_message_rules.id", ondelete="CASCADE"), index=True
+    )
+    run_date: Mapped[date] = mapped_column(Date)
+    claimed_count: Mapped[int] = mapped_column(Integer, default=0)
+    completed_count: Mapped[int] = mapped_column(Integer, default=0)
+    succeeded_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0)
+    notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    rule: Mapped[ScheduledMessageRule] = relationship(back_populates="daily_runs")
+
+
+class ScheduledMessage(Base):
+    __tablename__ = "scheduled_messages"
+    __table_args__ = (
+        CheckConstraint(
+            "base_minute >= 0 AND base_minute <= 1439",
+            name="ck_scheduled_messages_base_minute",
+        ),
+        CheckConstraint(
+            "random_offset_minutes >= 0 AND random_offset_minutes <= 720",
+            name="ck_scheduled_messages_random_offset",
+        ),
+        UniqueConstraint(
+            "rule_id",
+            "account_id",
+            name="uq_scheduled_messages_rule_account",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rule_id: Mapped[int] = mapped_column(
+        ForeignKey("scheduled_message_rules.id", ondelete="CASCADE"), index=True
+    )
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("tg_accounts.id", ondelete="CASCADE"), index=True
+    )
+    target_ref: Mapped[str] = mapped_column(String(256))
+    message_text: Mapped[str] = mapped_column(Text)
+    base_minute: Mapped[int] = mapped_column(Integer)
+    random_offset_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Singapore")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    next_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    rule: Mapped[ScheduledMessageRule] = relationship(back_populates="assignments")
 
 
 class AuditLog(Base):

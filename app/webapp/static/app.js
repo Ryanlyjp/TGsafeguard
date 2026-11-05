@@ -14,6 +14,10 @@ const state = {
   noticeTimer: null,
   qrLoginGeneration: 0,
   qrLoginId: null,
+  messageAccounts: [],
+  schedules: [],
+  selectedMessageAccounts: new Set(),
+  selectedScheduleAccounts: new Set(),
 };
 
 const qs = (selector, root = document) => root.querySelector(selector);
@@ -56,7 +60,7 @@ function escapeHtml(value) {
 }
 
 function statusClass(status) {
-  return ["normal", "limited", "banned", "unknown", "active", "new", "session_invalid", "running", "pending", "completed", "succeeded", "finished", "finished_with_errors", "failed"]
+  return ["normal", "limited", "banned", "unknown", "active", "new", "session_invalid", "running", "pending", "completed", "succeeded", "finished", "finished_with_errors", "failed", "skipped"]
     .includes(status) ? status : "unknown";
 }
 
@@ -65,7 +69,7 @@ function statusLabel(status) {
     normal: "正常", limited: "限制", banned: "封禁", unknown: "未知",
     active: "未检测", new: "未检测", session_invalid: "Session 失效",
     pending: "等待中", running: "运行中", completed: "已完成", finished: "已完成",
-    succeeded: "已成功", failed: "失败", partial: "部分完成", finished_with_errors: "部分失败",
+    succeeded: "已成功", failed: "失败", skipped: "已跳过", partial: "部分完成", finished_with_errors: "部分失败",
   };
   return labels[status] || status || "未知";
 }
@@ -76,6 +80,17 @@ function formatTime(value) {
   if (Number.isNaN(date.getTime())) return String(value);
   return new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+  }).format(date);
+}
+
+function formatSingaporeTime(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Singapore",
+    month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+    hourCycle: "h23",
   }).format(date);
 }
 
@@ -196,6 +211,9 @@ function switchActionPane(pane) {
   state.activePane = pane;
   qsa(".segment").forEach((button) => button.classList.toggle("active", button.dataset.actionPane === pane));
   qsa(".action-pane").forEach((section) => section.classList.toggle("active", section.dataset.pane === pane));
+  if (["message", "schedule"].includes(pane)) {
+    loadMessageTools().catch((error) => showNotice(`消息功能加载失败：${error.message}`, "error"));
+  }
 }
 
 function updateBackButton() {
@@ -497,6 +515,8 @@ function renderAccountDetail(account) {
       <button class="secondary-button" type="button" data-account-action="service_check">同步服务消息</button>
       <button class="secondary-button" type="button" data-account-action="export_session">导出 Session</button>
       <button class="secondary-button" type="button" data-account-action="rotate_login_email">一键换绑邮箱</button>
+      <button class="secondary-button" type="button" data-account-action="send_message">发送消息</button>
+      <button class="secondary-button" type="button" data-account-action="schedule_message">设置自动发送</button>
     </div>
     <div class="detail-sections">
       <details class="detail-section" open><summary>资料与头像</summary><div class="detail-section-body">
@@ -526,6 +546,8 @@ function renderAccountDetail(account) {
   qsa("[data-account-action]", detail).forEach((button) => button.addEventListener("click", () => {
     const action = button.dataset.accountAction;
     if (action === "export_session") exportSessions({ mode: "single", account_id: account.id }, button);
+    else if (action === "send_message") openMessageTool("message", account.id);
+    else if (action === "schedule_message") openMessageTool("schedule", account.id);
     else runAccountAction(account.id, action, button);
   }));
   qs("#profileForm", detail).addEventListener("submit", (event) => submitProfile(event, account.id));
@@ -944,6 +966,231 @@ async function submitRate(event) {
   finally { setBusy(button, false); }
 }
 
+function accountPicker(containerId, selected) {
+  const container = qs(`#${containerId}`);
+  container.replaceChildren(...state.messageAccounts.map((account) => {
+    const label = document.createElement("label");
+    label.className = "account-choice";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = selected.has(Number(account.id));
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) selected.add(Number(account.id));
+      else selected.delete(Number(account.id));
+    });
+    const identity = account.username ? `@${account.username}` : account.phone_masked;
+    const text = document.createElement("span");
+    text.textContent = `#${account.id} · ${identity}`;
+    label.append(checkbox, text);
+    return label;
+  }));
+  if (!state.messageAccounts.length) {
+    container.innerHTML = '<div class="empty-state">暂无 active 账号</div>';
+  }
+}
+
+function setAccountSelection(kind, selectAll) {
+  const selected = kind === "message" ? state.selectedMessageAccounts : state.selectedScheduleAccounts;
+  selected.clear();
+  if (selectAll) {
+    state.messageAccounts.forEach((account) => selected.add(Number(account.id)));
+  }
+  accountPicker(`${kind}AccountPicker`, selected);
+}
+
+function setScheduleSelectionControlsDisabled(disabled) {
+  qs("#selectAllScheduleAccounts").disabled = disabled;
+  qs("#clearScheduleAccounts").disabled = disabled;
+}
+
+function reuseMessageHistory(job) {
+  const params = job.params || {};
+  const text = params.text || params.payload?.text || "";
+  const accountIds = Array.isArray(params.accounts) ? params.accounts.map(Number) : [];
+  switchView("actions");
+  if (job.type === "scheduled_send") {
+    const rule = state.schedules.find((item) => Number(item.id) === Number(params.schedule_id));
+    if (rule) {
+      reuseSchedule(rule);
+      return;
+    }
+    cancelScheduleEdit();
+    state.selectedScheduleAccounts = new Set(accountIds);
+    accountPicker("scheduleAccountPicker", state.selectedScheduleAccounts);
+    qs("#scheduleTarget").value = params.target || "";
+    qs("#scheduleText").value = text;
+    switchActionPane("schedule");
+  } else {
+    state.selectedMessageAccounts = new Set(accountIds);
+    accountPicker("messageAccountPicker", state.selectedMessageAccounts);
+    qs("#messageTarget").value = params.target || "";
+    qs("#messageText").value = text;
+    switchActionPane("message");
+  }
+}
+
+function renderMessageHistory(jobs, containerId, scheduledOnly = false) {
+  const list = qs(`#${containerId}`);
+  const visibleJobs = scheduledOnly ? jobs.filter((job) => job.type === "scheduled_send") : jobs;
+  list.replaceChildren(...visibleJobs.map((job) => {
+    const row = document.createElement("article");
+    row.className = "account-row compact-row";
+    const params = job.params || {};
+    const text = params.text || params.payload?.text || "";
+    const ok = Number(job.items?.ok || 0);
+    const failed = Number(job.items?.failed || 0);
+    const skipped = Number(job.items?.skipped || 0);
+    const reusable = Array.isArray(params.accounts) && params.accounts.length && params.target && text;
+    row.innerHTML = `<div class="row-main"><div><div class="row-title">${job.type === "scheduled_send" ? "自动发送" : "手动发送"} · ${escapeHtml(params.target || "—")}</div><div class="row-meta">${escapeHtml(formatTime(job.started_at))} · 成功 ${ok} / 失败 ${failed} / 跳过 ${skipped} · ${escapeHtml(text)}</div></div><span class="status ${statusClass(job.status)}">${escapeHtml(statusLabel(job.status))}</span></div>${reusable ? '<div class="button-row schedule-row-actions"><button class="link-button" type="button" data-history-reuse>复用</button></div>' : ""}`;
+    qs("[data-history-reuse]", row)?.addEventListener("click", () => reuseMessageHistory(job));
+    return row;
+  }));
+  if (!visibleJobs.length) list.innerHTML = '<div class="empty-state">暂无发送记录</div>';
+}
+
+function renderSchedules(schedules) {
+  const list = qs("#scheduleList");
+  list.replaceChildren(...schedules.map((rule) => {
+    const row = document.createElement("article");
+    row.className = "account-row";
+    const nextRun = formatSingaporeTime(rule.next_run_at);
+    row.innerHTML = `<div class="row-main"><div><div class="row-title">#${Number(rule.account_id)} → ${escapeHtml(rule.target)}</div><div class="row-meta">${escapeHtml(rule.base_time)} ±${Number(rule.random_offset_minutes)} 分钟 · 下次 ${escapeHtml(nextRun)} · ${escapeHtml(rule.text)}</div></div><span class="status ${rule.enabled ? "normal" : "unknown"}">${rule.enabled ? "已启用" : "已停用"}</span></div><div class="button-row schedule-row-actions"><button class="link-button" type="button" data-schedule-action="reuse">复用</button><button class="link-button" type="button" data-schedule-action="edit">修改</button><button class="link-button" type="button" data-schedule-action="toggle">${rule.enabled ? "停用" : "启用"}</button><button class="link-button danger-text" type="button" data-schedule-action="delete">删除</button></div>`;
+    qs('[data-schedule-action="reuse"]', row).addEventListener("click", () => reuseSchedule(rule));
+    qs('[data-schedule-action="edit"]', row).addEventListener("click", () => editSchedule(rule));
+    qs('[data-schedule-action="toggle"]', row).addEventListener("click", () => changeSchedule("toggle", rule));
+    qs('[data-schedule-action="delete"]', row).addEventListener("click", () => changeSchedule("delete", rule));
+    return row;
+  }));
+  if (!schedules.length) list.innerHTML = '<div class="empty-state">暂无自动发送规则</div>';
+}
+
+async function loadMessageTools() {
+  const [accounts, schedules, history] = await Promise.all([
+    api("/message-accounts"),
+    api("/scheduled-messages"),
+    api("/jobs?limit=20&message_only=1"),
+  ]);
+  state.messageAccounts = accounts.accounts || [];
+  state.schedules = schedules.schedules || [];
+  accountPicker("messageAccountPicker", state.selectedMessageAccounts);
+  accountPicker("scheduleAccountPicker", state.selectedScheduleAccounts);
+  renderSchedules(state.schedules);
+  renderMessageHistory(history.jobs || [], "messageHistory");
+  renderMessageHistory(history.jobs || [], "scheduleHistory", true);
+}
+
+async function openMessageTool(pane, accountId) {
+  closeAccountDetail(false);
+  switchView("actions");
+  if (pane === "message") {
+    state.selectedMessageAccounts = new Set([Number(accountId)]);
+  } else {
+    state.selectedScheduleAccounts = new Set([Number(accountId)]);
+  }
+  switchActionPane(pane);
+}
+
+async function sendMessageNow() {
+  const button = qs("#sendMessageBtn");
+  const payload = {
+    account_ids: [...state.selectedMessageAccounts],
+    target: qs("#messageTarget").value,
+    text: qs("#messageText").value,
+  };
+  if (!payload.account_ids.length) return showNotice("请至少勾选一个账号", "error");
+  setBusy(button, true, "正在发送…");
+  try {
+    const result = await api("/messages/send", { method: "POST", body: JSON.stringify(payload) });
+    showNotice(result.message, result.failed ? "error" : "ok");
+    await loadMessageTools();
+  } catch (error) {
+    showNotice(`发送失败：${error.message}`, "error");
+  } finally { setBusy(button, false); }
+}
+
+function selectedScheduleOffset() {
+  const value = qs("#scheduleOffset").value;
+  return Number(value === "custom" ? qs("#scheduleCustomOffset").value : value);
+}
+
+async function saveSchedule() {
+  const button = qs("#saveScheduleBtn");
+  const scheduleId = Number(qs("#scheduleId").value || 0);
+  const payload = {
+    action: scheduleId ? "update" : "create",
+    schedule_id: scheduleId || undefined,
+    account_ids: [...state.selectedScheduleAccounts],
+    target: qs("#scheduleTarget").value,
+    text: qs("#scheduleText").value,
+    base_time: qs("#scheduleTime").value,
+    random_offset_minutes: selectedScheduleOffset(),
+  };
+  if (!scheduleId && !payload.account_ids.length) return showNotice("请至少勾选一个账号", "error");
+  setBusy(button, true, scheduleId ? "正在保存…" : "正在创建…");
+  try {
+    const result = await api("/scheduled-messages", { method: "POST", body: JSON.stringify(payload) });
+    showNotice(result.message, "ok");
+    cancelScheduleEdit();
+    await loadMessageTools();
+  } catch (error) {
+    showNotice(`保存失败：${error.message}`, "error");
+  } finally { setBusy(button, false); }
+}
+
+function editSchedule(rule) {
+  qs("#scheduleId").value = rule.id;
+  qs("#scheduleTarget").value = rule.target;
+  qs("#scheduleText").value = rule.text;
+  qs("#scheduleTime").value = rule.base_time;
+  const preset = [0, 15, 30, 60, 120].includes(Number(rule.random_offset_minutes));
+  qs("#scheduleOffset").value = preset ? String(rule.random_offset_minutes) : "custom";
+  qs("#scheduleCustomOffset").value = rule.random_offset_minutes;
+  qs("#scheduleCustomOffsetLabel").classList.toggle("hidden", preset);
+  state.selectedScheduleAccounts = new Set([Number(rule.account_id)]);
+  accountPicker("scheduleAccountPicker", state.selectedScheduleAccounts);
+  qsa("#scheduleAccountPicker input").forEach((input) => { input.disabled = true; });
+  setScheduleSelectionControlsDisabled(true);
+  qs("#saveScheduleBtn").textContent = "保存修改";
+  qs("#cancelScheduleEditBtn").classList.remove("hidden");
+  qs("#scheduleTarget").focus();
+}
+
+function reuseSchedule(rule) {
+  cancelScheduleEdit();
+  qs("#scheduleTarget").value = rule.target;
+  qs("#scheduleText").value = rule.text;
+  qs("#scheduleTime").value = rule.base_time;
+  const preset = [0, 15, 30, 60, 120].includes(Number(rule.random_offset_minutes));
+  qs("#scheduleOffset").value = preset ? String(rule.random_offset_minutes) : "custom";
+  qs("#scheduleCustomOffset").value = rule.random_offset_minutes;
+  qs("#scheduleCustomOffsetLabel").classList.toggle("hidden", preset);
+  state.selectedScheduleAccounts = new Set([Number(rule.account_id)]);
+  accountPicker("scheduleAccountPicker", state.selectedScheduleAccounts);
+  switchView("actions");
+  switchActionPane("schedule");
+  qs("#scheduleTarget").focus();
+}
+
+function cancelScheduleEdit() {
+  qs("#scheduleId").value = "";
+  qs("#saveScheduleBtn").textContent = "批量创建规则";
+  qs("#cancelScheduleEditBtn").classList.add("hidden");
+  setScheduleSelectionControlsDisabled(false);
+  accountPicker("scheduleAccountPicker", state.selectedScheduleAccounts);
+}
+
+async function changeSchedule(action, rule) {
+  if (action === "delete" && !(await confirmAction(`确认删除账号 #${rule.account_id} 的这条自动发送规则？`))) return;
+  try {
+    const result = await api("/scheduled-messages", {
+      method: "POST",
+      body: JSON.stringify({ action, schedule_id: rule.id, enabled: !rule.enabled }),
+    });
+    showNotice(result.message, "ok");
+    await loadMessageTools();
+  } catch (error) { showNotice(`操作失败：${error.message}`, "error"); }
+}
+
 qsa(".tab").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
 qsa(".segment").forEach((button) => button.addEventListener("click", () => switchActionPane(button.dataset.actionPane)));
 qsa("[data-view-jump]").forEach((button) => button.addEventListener("click", () => {
@@ -978,6 +1225,16 @@ qs("#sessionExportForm").addEventListener("submit", submitSessionExport);
 qs("#targetForm").addEventListener("submit", submitTarget);
 qs("#rateForm").addEventListener("submit", submitRate);
 qs("#reloadTargetsBtn").addEventListener("click", () => loadBootstrap());
+qs("#sendMessageBtn").addEventListener("click", sendMessageNow);
+qs("#selectAllMessageAccounts").addEventListener("click", () => setAccountSelection("message", true));
+qs("#clearMessageAccounts").addEventListener("click", () => setAccountSelection("message", false));
+qs("#selectAllScheduleAccounts").addEventListener("click", () => setAccountSelection("schedule", true));
+qs("#clearScheduleAccounts").addEventListener("click", () => setAccountSelection("schedule", false));
+qs("#saveScheduleBtn").addEventListener("click", saveSchedule);
+qs("#cancelScheduleEditBtn").addEventListener("click", cancelScheduleEdit);
+qs("#scheduleOffset").addEventListener("change", (event) => {
+  qs("#scheduleCustomOffsetLabel").classList.toggle("hidden", event.currentTarget.value !== "custom");
+});
 
 if (tg) {
   tg.ready();

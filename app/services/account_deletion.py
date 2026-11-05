@@ -18,6 +18,7 @@ from app.db.models import (
     LoginEmailProtectionEvent,
     LoginEmailWhitelist,
     PrivacySettings,
+    ScheduledMessage,
     ServiceMessage,
     SpamCheck,
     TempMailMessage,
@@ -38,6 +39,12 @@ class AccountDeletionResult:
     deleted_rows: int
 
 
+def account_jobs_statement(account_id: int):
+    return select(Job).where(
+        Job.id.in_(select(JobItem.job_id).where(JobItem.account_id == account_id))
+    )
+
+
 def account_owned_delete_statements(account_id: int) -> tuple[Any, ...]:
     """Build narrowly scoped statements in foreign-key-safe deletion order."""
     return (
@@ -49,6 +56,7 @@ def account_owned_delete_statements(account_id: int) -> tuple[Any, ...]:
         delete(SpamCheck).where(SpamCheck.account_id == account_id),
         delete(PrivacySettings).where(PrivacySettings.account_id == account_id),
         delete(AccountSecurity).where(AccountSecurity.account_id == account_id),
+        delete(ScheduledMessage).where(ScheduledMessage.account_id == account_id),
         delete(TgSession).where(TgSession.account_id == account_id),
         delete(JobItem).where(JobItem.account_id == account_id),
         delete(AuditLog).where(
@@ -114,12 +122,7 @@ async def delete_account_records(
 
     jobs = list(
         (
-            await session.scalars(
-                select(Job)
-                .join(JobItem, JobItem.job_id == Job.id)
-                .where(JobItem.account_id == account_id)
-                .distinct()
-            )
+            await session.scalars(account_jobs_statement(account_id))
         ).all()
     )
     for job in jobs:

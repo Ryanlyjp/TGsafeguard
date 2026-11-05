@@ -21,4 +21,5 @@ data/backups/
 *.7z
 *.log
 progress.md
+docs/
 docs/hugh-nl-deployment.md

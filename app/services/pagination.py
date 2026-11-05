@@ -5,11 +5,16 @@ MAX_SYSTEM_ACCOUNTS = 50
 ACCOUNT_CAPACITY_LOCK_ID = 84502117
 
 
-def account_page_window(total: int, requested_page: int) -> tuple[int, int, int]:
+def account_page_window(
+    total: int,
+    requested_page: int,
+    *,
+    page_size: int = ACCOUNT_PAGE_SIZE,
+) -> tuple[int, int, int]:
     """Return the clamped page, page count, and database offset."""
-    pages = (total + ACCOUNT_PAGE_SIZE - 1) // ACCOUNT_PAGE_SIZE
+    pages = (total + page_size - 1) // page_size
     page = min(requested_page, max(pages, 1))
-    return page, pages, (page - 1) * ACCOUNT_PAGE_SIZE
+    return page, pages, (page - 1) * page_size
 
 
 def require_account_capacity(total: int) -> None:

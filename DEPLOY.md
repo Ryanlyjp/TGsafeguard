@@ -61,6 +61,8 @@ sudo install -d -o tg-account-bot -g tg-account-bot -m 700 \
   data/sessions data/backups
 ```
 
+依赖清单使用 `SQLAlchemy[asyncio]`，确保全新环境会同时安装异步数据库运行所需的 `greenlet`。
+
 ## 3. 创建 PostgreSQL 数据库
 
 创建数据库用户时会交互式要求输入两次新密码，避免把明文密码写进 Shell 历史：
@@ -201,6 +203,8 @@ sudo -u tg-account-bot .venv/bin/python -m app.main
 ```
 
 看到 Bot 开始 polling 且无数据库迁移错误后，用 `Ctrl+C` 停止，再配置 systemd。
+
+当前版本的自动发送功能要求数据库迁移到 `0012_scheduled_daily_reports`。服务启动后会在进程内启动调度任务；无需额外安装 cron 或 systemd timer。Bot-only 部署可以保持 `MINI_APP_ENABLED=false` 且不配置公网域名，聊天内仍可完成多账号手动发送、规则创建和规则管理。主规则保存批量模板，每个应用账号保存独立执行副本；账号副本可以单独修改，但后续主规则修改会覆盖所有仍应用该规则的账号副本。`0012` 持久化每个主规则按新加坡日期计算的执行汇总，用于在所有当日账号结束后只发送一次汇总通知，并在重启后避免重复通知。
 
 ## 7. 配置 systemd
 
@@ -392,6 +396,15 @@ sudo systemctl status tg-account-bot --no-pager
 ```
 
 如果新版本迁移失败，不要反复重启服务。保留日志、当前代码版本和迁移输出，再决定修复或从升级前备份恢复。
+
+升级后可确认迁移和调度服务均正常：
+
+```bash
+sudo -u tg-account-bot .venv/bin/alembic current
+sudo journalctl -u tg-account-bot -n 100 --no-pager
+```
+
+迁移版本应为 `0012_scheduled_daily_reports (head)`，日志中不应出现 `Scheduled message processing failed`。自动发送使用新加坡时区，错过的当日执行会记录为 `skipped`，不会在服务恢复后补发；同一主规则当天全部账号结束后只发送一条成功、失败和跳过汇总。
 
 ## 13. 常见故障
 
